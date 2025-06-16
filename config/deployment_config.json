@@ -1,0 +1,67 @@
+{
+  "model_info": {
+    "architecture": "YOLOv11-nano",
+    "purpose": "ANPR (Automatic Number Plate Recognition)",
+    "classes": [
+      "Car",
+      "Motorcycle",
+      "Number_Plate"
+    ],
+    "excluded_classes": [
+      "person",
+      "bicycle",
+      "dog",
+      "cat",
+      "bird",
+      "horse",
+      "sheep",
+      "cow",
+      "etc"
+    ],
+    "input_size": 416,
+    "framework": "ultralytics",
+    "optimized_for": "vehicle_and_plate_detection"
+  },
+  "inference_config": {
+    "confidence_threshold": 0.25,
+    "iou_threshold": 0.45,
+    "max_detections": 100,
+    "agnostic_nms": false,
+    "filter_classes": [
+      0,
+      1,
+      2
+    ],
+    "anpr_mode": true
+  },
+  "optimization": {
+    "half_precision": true,
+    "tensorrt": false,
+    "onnx_export": true,
+    "batch_inference": true
+  },
+  "anpr_specific_settings": {
+    "focus_classes": [
+      "Car",
+      "Motorcycle",
+      "Number_Plate"
+    ],
+    "ignore_general_objects": true,
+    "license_plate_optimized": true,
+    "vehicle_context_aware": true
+  },
+  "deployment_targets": {
+    "edge_devices": true,
+    "mobile": true,
+    "server": true,
+    "traffic_cameras": true,
+    "parking_systems": true,
+    "estimated_fps": {
+      "gpu_rtx3060": "80-120 FPS (ANPR)",
+      "gpu_gtx1660": "50-80 FPS (ANPR)",
+      "cpu_i7": "15-25 FPS (ANPR)",
+      "jetson_nano": "8-15 FPS (ANPR)",
+      "raspberry_pi_4": "3-8 FPS (ANPR)"
+    }
+  }
+}

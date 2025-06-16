@@ -1,0 +1,30 @@
+# ANPR (Automatic Number Plate Recognition) Requirements
+# Core deep learning and computer vision
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+
+# GUI framework
+PyQt5>=5.15.0
+
+# Image processing and utilities
+Pillow>=9.0.0
+numpy>=1.21.0
+pandas>=1.5.0
+
+# Optional: Fast CTC decoding (for better OCR performance)
+# fast-ctc-decode
+
+# Logging and utilities
+pathlib2>=2.3.0
+tqdm>=4.64.0
+
+# Data science and visualization
+matplotlib>=3.5.0
+scikit-learn>=1.1.0
+
+# Development and testing (optional)
+pytest>=7.0.0
+black>=22.0.0
+flake8>=5.0.0 

@@ -1,0 +1,23 @@
+anpr_optimized: true
+ignore_classes:
+- person
+- bicycle
+- dog
+- cat
+- bird
+- horse
+- sheep
+- cow
+- elephant
+- bear
+- zebra
+- giraffe
+names:
+- Car
+- Motorcycle
+- Number_Plate
+nc: 3
+path: data/annotations
+test: test/images
+train: train/images
+val: valid/images
