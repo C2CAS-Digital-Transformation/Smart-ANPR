@@ -58,7 +58,7 @@ class ModelConfig:
     # CRNN OCR Configuration
     OCR_IMG_HEIGHT = 64
     OCR_IMG_WIDTH = 256
-    OCR_MIN_CONFIDENCE = 0.3
+    OCR_MIN_CONFIDENCE = 0.85
     OCR_HIDDEN_SIZE = 256
     OCR_DROPOUT_RATE = 0.3
     

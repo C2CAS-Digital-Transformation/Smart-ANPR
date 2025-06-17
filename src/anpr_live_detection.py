@@ -40,11 +40,8 @@ except ImportError:
     print("Warning: ultralytics not available. YOLO detection will be disabled.")
     YOLO_AVAILABLE = False
 
-# Import our configuration
-from utils.config import Paths, ModelConfig, CameraConfig, ProcessingConfig
-
 # Setup logging
-log_dir = Paths.LOGS_DIR
+log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
 log_file = log_dir / f"anpr_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
@@ -60,37 +57,37 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 class Config:
-    # Model paths (using new structure)
-    YOLO_MODEL_PATH = str(Paths.YOLO_MODEL_PATH)
-    CRNN_MODEL_PATH = str(Paths.CRNN_MODEL_PATH)
-    CRNN_MODEL_PATH_ALT = str(Paths.CRNN_MODEL_PATH)
+    # Model paths (using user provided paths)
+    YOLO_MODEL_PATH = r"D:\Work\Projects\ANPR_3\anpr_lightweight\yolo11n_anpr_small_batch\weights\best.pt"
+    CRNN_MODEL_PATH = r"D:\Work\Projects\ANPR_3\saved_models\stable_crnn_v6\best_multiline_crnn_epoch292_acc0.9304.pth"
+    CRNN_MODEL_PATH_ALT = r"D:\Work\Projects\ANPR_3\saved_models\stable_crnn_v6\checkpoint_epoch_310_acc0.923.pth"
     
     # Video path
-    VIDEO_PATH = str(Paths.DATA_RAW / "video")
+    VIDEO_PATH = r"D:\Work\Projects\ANPR_3\data\video"
     
     # Camera configuration
-    DEFAULT_CAMERA_INDEX = CameraConfig.DEFAULT_CAMERA_INDEX
-    CAMERA_WIDTH = CameraConfig.CAMERA_WIDTH
-    CAMERA_HEIGHT = CameraConfig.CAMERA_HEIGHT
-    CAMERA_FPS = CameraConfig.CAMERA_FPS
+    DEFAULT_CAMERA_INDEX = 0
+    CAMERA_WIDTH = 1280  # Default camera resolution
+    CAMERA_HEIGHT = 720
+    CAMERA_FPS = 30
     
     # Detection parameters
-    CONFIDENCE_THRESHOLD = ModelConfig.YOLO_CONFIDENCE_THRESHOLD
-    NMS_THRESHOLD = ModelConfig.YOLO_IOU_THRESHOLD
-    MIN_PLATE_AREA = ProcessingConfig.MIN_PLATE_AREA
-    PLATE_CONFIDENCE_THRESHOLD = ProcessingConfig.PLATE_CONFIDENCE_THRESHOLD
+    CONFIDENCE_THRESHOLD = 0.3  # Reasonable threshold for better detection
+    NMS_THRESHOLD = 0.45
+    MIN_PLATE_AREA = 400  # Minimum area for license plate (increased to reduce false positives)
+    PLATE_CONFIDENCE_THRESHOLD = 0.2  # Separate threshold for plates
     
     # OCR parameters  
-    OCR_IMG_HEIGHT = ModelConfig.OCR_IMG_HEIGHT
-    OCR_IMG_WIDTH = ModelConfig.OCR_IMG_WIDTH
-    MIN_OCR_CONFIDENCE = ModelConfig.OCR_MIN_CONFIDENCE
+    OCR_IMG_HEIGHT = 64
+    OCR_IMG_WIDTH = 256
+    MIN_OCR_CONFIDENCE = 0.3  # Lowered from 0.5 to 0.3 for debugging
     
     # Duplicate prevention
-    DUPLICATE_TIME_WINDOW = ProcessingConfig.DUPLICATE_TIME_WINDOW
-    SIMILARITY_THRESHOLD = ProcessingConfig.SIMILARITY_THRESHOLD
+    DUPLICATE_TIME_WINDOW = 5.0  # seconds
+    SIMILARITY_THRESHOLD = 0.8
     
     # Output
-    OUTPUT_DIR = Paths.OUTPUT_DIR
+    OUTPUT_DIR = Path(r"D:\Work\Projects\ANPR_3\output\v1")
 
 @dataclass
 class Detection:
@@ -1246,6 +1243,12 @@ class ANPRProcessor:
                                 logger.info(f"🔍 ZONE OCR: Plate {text} already processed in current zone session")
                             elif not text:
                                 logger.warning(f"⚠️ ZONE OCR: No text recognized from plate region (shape: {plate_region.shape})")
+                                # Save the plate region that failed OCR for analysis
+                                if plate_region.size > 0:
+                                    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+                                    failed_ocr_path = Config.OUTPUT_DIR / f"debug_failed_ocr_{timestamp_str}.jpg"
+                                    cv2.imwrite(str(failed_ocr_path), plate_region)
+                                    logger.warning(f"⚠️ ZONE OCR: Saved failed OCR region to {failed_ocr_path}")
                             elif conf < debug_min_conf:
                                 logger.warning(f"⚠️ ZONE OCR: Plate '{text}' confidence too low: {conf:.3f} < {debug_min_conf}")
                             else:
