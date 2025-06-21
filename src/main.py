@@ -41,7 +41,7 @@ except ImportError:
     YOLO_AVAILABLE = False
 
 # Import our configuration
-from utils.config import Paths, ModelConfig, CameraConfig, ProcessingConfig
+from utils.config import Paths, ModelConfig, CameraConfig, ProcessingConfig, get_available_yolo_model, get_available_crnn_model
 
 # Setup logging
 log_dir = Paths.LOGS_DIR
@@ -52,7 +52,7 @@ logging.basicConfig(
     level=logging.INFO,  # Changed to INFO to reduce spam but keep important messages
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_file),
+        logging.FileHandler(log_file, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -60,10 +60,9 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 class Config:
-    # Model paths (using new structure)
-    YOLO_MODEL_PATH = str(Paths.YOLO_MODEL_PATH)
-    CRNN_MODEL_PATH = str(Paths.CRNN_MODEL_PATH)
-    CRNN_MODEL_PATH_ALT = str(Paths.CRNN_MODEL_PATH)
+    # Model paths (using dynamic paths from config)
+    YOLO_MODEL_PATH = get_available_yolo_model()
+    CRNN_MODEL_PATH = get_available_crnn_model()
     
     # Video path
     VIDEO_PATH = str(Paths.DATA_RAW / "video")
@@ -102,7 +101,72 @@ class Detection:
     frame_id: int
     detection_type: str = "plate"  # "car" or "plate"
     plate_type: str = "unknown"  # "green", "white", "red", "unknown"
+    car_color: str = "unknown"  # detected car color
+    car_model: str = "unknown"  # detected car model/type
     
+# --- Attention-based Decoder (for multi-task learning) ---
+class Attention(nn.Module):
+    def __init__(self, encoder_hidden_dim, decoder_hidden_dim):
+        super().__init__()
+        self.attn = nn.Linear(encoder_hidden_dim + decoder_hidden_dim, decoder_hidden_dim)
+        self.v = nn.Parameter(torch.rand(decoder_hidden_dim))
+        
+    def forward(self, hidden, encoder_outputs):
+        # hidden = [1, batch_size, dec_hid_dim]
+        # encoder_outputs = [seq_len, batch_size, enc_hid_dim]
+        batch_size = encoder_outputs.shape[1]
+        src_len = encoder_outputs.shape[0]
+        
+        hidden = hidden.repeat(src_len, 1, 1) # [src_len, batch_size, dec_hid_dim]
+        
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        # energy = [src_len, batch_size, dec_hid_dim]
+
+        energy = energy.permute(0, 2, 1) # [src_len, dec_hid_dim, batch_size]
+        v = self.v.repeat(batch_size, 1).unsqueeze(1) # [batch_size, 1, dec_hid_dim]
+        energy = torch.bmm(v, energy.permute(2, 1, 0)).squeeze(1) # [batch_size, src_len]
+        
+        return torch.nn.functional.softmax(energy, dim=1)
+
+class AttentionDecoder(nn.Module):
+    def __init__(self, output_dim, emb_dim, encoder_hidden_dim, decoder_hidden_dim, dropout):
+        super().__init__()
+        self.output_dim = output_dim
+        # Store hidden dimension so it can be accessed externally for zero-init
+        self.decoder_hidden_dim = decoder_hidden_dim
+        self.attention = Attention(encoder_hidden_dim, decoder_hidden_dim)
+        self.embedding = nn.Embedding(output_dim, emb_dim)
+        self.rnn = nn.GRU(encoder_hidden_dim + emb_dim, decoder_hidden_dim)
+        self.fc_out = nn.Linear(encoder_hidden_dim + decoder_hidden_dim + emb_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input, hidden, encoder_outputs):
+        # input = [batch_size]
+        # hidden = [1, batch_size, dec_hid_dim]
+        # encoder_outputs = [src_len, batch_size, enc_hid_dim]
+        input = input.unsqueeze(0) # [1, batch_size]
+        
+        embedded = self.dropout(self.embedding(input)) # [1, batch_size, emb_dim]
+        
+        a = self.attention(hidden, encoder_outputs).unsqueeze(1) # [batch_size, 1, src_len]
+        
+        encoder_outputs = encoder_outputs.permute(1, 0, 2) # [batch_size, src_len, enc_hid_dim]
+        
+        weighted = torch.bmm(a, encoder_outputs) # [batch_size, 1, enc_hid_dim]
+        weighted = weighted.permute(1, 0, 2) # [1, batch_size, enc_hid_dim]
+        
+        rnn_input = torch.cat((embedded, weighted), dim=2)
+        
+        output, hidden = self.rnn(rnn_input, hidden)
+        
+        embedded = embedded.squeeze(0)
+        output = output.squeeze(0)
+        weighted = weighted.squeeze(0)
+        
+        prediction = self.fc_out(torch.cat((output, weighted, embedded), dim=1))
+        
+        return prediction, hidden.squeeze(0)
+
 class ImprovedBidirectionalLSTM(nn.Module):
     """Improved Bidirectional LSTM layer"""
     def __init__(self, input_size, hidden_size, output_size, num_layers=2, dropout=0.1):
@@ -125,11 +189,16 @@ class ImprovedBidirectionalLSTM(nn.Module):
         return output
 
 class CustomCRNN(nn.Module):
-    """Custom CRNN model for license plate recognition"""
-    def __init__(self, img_height, n_classes, n_hidden=256, dropout_rate=0.3, input_channels=3):
+    """Custom CRNN model for license plate recognition with attention mechanism"""
+    def __init__(self, img_height, n_classes, n_hidden=512, dropout_rate=0.4, input_channels=1):
         super(CustomCRNN, self).__init__()
         self.input_channels = input_channels
+        
+        # Constants for model architecture
+        NUM_VERTICAL_ROWS = 3  # Keep 3 rows for multi-line support
+        
         self.cnn = nn.Sequential(
+            # Using 1 input channel for grayscale images (matching training)
             nn.Conv2d(input_channels, 32, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(32), nn.ReLU(True), nn.Dropout2d(dropout_rate * 0.5),
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(64), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
@@ -148,20 +217,60 @@ class CustomCRNN(nn.Module):
             nn.Conv2d(512, 512, kernel_size=2, stride=1, padding=0), nn.BatchNorm2d(512), nn.ReLU(True), nn.Dropout2d(dropout_rate)
         )
         
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, None))
-        self.rnn_input_size = 512 
-        self.rnn1 = ImprovedBidirectionalLSTM(self.rnn_input_size, n_hidden // 2, n_hidden // 2, num_layers=2, dropout=dropout_rate)
-        self.rnn2 = ImprovedBidirectionalLSTM(n_hidden // 2, n_hidden // 2, n_classes, num_layers=1, dropout=dropout_rate)
+        # Keep multiple rows for multi-line support
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((NUM_VERTICAL_ROWS, None))
+        self.rnn_input_size = 512 * NUM_VERTICAL_ROWS  # Multiply by number of rows
+        self.rnn1 = ImprovedBidirectionalLSTM(self.rnn_input_size, n_hidden, n_hidden, num_layers=2, dropout=dropout_rate)
+        self.rnn2 = ImprovedBidirectionalLSTM(n_hidden, n_hidden, n_classes, num_layers=1, dropout=dropout_rate)
         
-    def forward(self, input_tensor):
+        # Attention Decoder for multi-task learning
+        self.attention_decoder = AttentionDecoder(
+            output_dim=n_classes,
+            emb_dim=256,
+            encoder_hidden_dim=n_hidden, # from rnn1
+            decoder_hidden_dim=n_hidden,
+            dropout=dropout_rate
+        )
+        
+    def forward(self, input_tensor, targets=None, teacher_forcing_ratio=0.5):
         conv = self.cnn(input_tensor)
         conv = self.adaptive_pool(conv)
-        conv = conv.squeeze(2)
-        conv = conv.permute(2, 0, 1)
+        # Reshape to combine channels and height dimensions
+        conv = conv.permute(3, 0, 1, 2)  # (W, B, C, H)
+        conv = conv.reshape(conv.size(0), conv.size(1), -1)  # (W, B, C*H)
         
-        output = self.rnn1(conv)
-        output = self.rnn2(output)
-        return output
+        encoder_outputs = self.rnn1(conv)
+        ctc_output = self.rnn2(encoder_outputs)
+
+        attention_output = None
+        if self.training and targets is not None:
+            import random
+            batch_size = targets.shape[0]
+            target_len = targets.shape[1]
+            
+            # Tensor to store decoder outputs
+            attention_outputs = torch.zeros(target_len, batch_size, self.attention_decoder.output_dim).to(input_tensor.device)
+
+            # Initial hidden state for the decoder (zeros)
+            decoder_hidden = torch.zeros(batch_size, self.attention_decoder.decoder_hidden_dim).to(input_tensor.device)
+            
+            # First input to the decoder is the <sos> token (using [blank] index 0)
+            decoder_input = torch.zeros(batch_size, dtype=torch.long).to(input_tensor.device)
+
+            for t in range(target_len):
+                decoder_output, decoder_hidden = self.attention_decoder(decoder_input, decoder_hidden.unsqueeze(0), encoder_outputs)
+                attention_outputs[t] = decoder_output
+                
+                # Decide if we are going to use teacher forcing
+                teacher_force = random.random() < teacher_forcing_ratio
+                top1 = decoder_output.argmax(1)
+                
+                # If teacher forcing, use actual next token; otherwise, use predicted token
+                decoder_input = targets[:, t] if teacher_force else top1
+            
+            attention_output = attention_outputs.permute(1, 0, 2) # [batch_size, target_len, output_dim]
+
+        return ctc_output, attention_output
 
 class ANPRProcessor:
     """Main ANPR processing class"""
@@ -174,8 +283,10 @@ class ANPRProcessor:
         self.yolo_model = None
         self.crnn_model = None
         self.char_list = None
+        self.car_type_model = None
         self.yolo_loaded = False
         self.crnn_loaded = False
+        self.car_type_model_loaded = False
         
         # Detection tracking
         self.recent_detections = deque(maxlen=100)
@@ -211,6 +322,11 @@ class ANPRProcessor:
         self.total_detections = 0
         self.unique_plates = set()
         
+        # Plate stabilization/consensus tracking
+        self.plate_groups = {}  # key: canonical_plate_text, value: {char_counts, last_seen}
+        self.plate_group_similarity_threshold = 2  # Max Levenshtein distance to be considered the same plate
+        self.plate_group_expiry_seconds = 5      # How long to track a plate group without new readings
+        
         # Plate type statistics
         self.plate_type_counts = {
             'white': 0,
@@ -221,25 +337,42 @@ class ANPRProcessor:
             'unknown': 0
         }
         
+        # Car color statistics
+        self.car_color_counts = {
+            'red': 0, 'blue': 0, 'green': 0, 'yellow': 0, 'orange': 0,
+            'purple': 0, 'pink': 0, 'black': 0, 'white': 0, 'gray': 0, 'unknown': 0
+        }
+        
+        # Car model statistics
+        self.car_model_counts = {cls: 0 for cls in ModelConfig.CAR_TYPE_CLASSES}
+        
         Config.OUTPUT_DIR.mkdir(exist_ok=True)
         
     def load_models(self):
         """Load YOLO and CRNN models"""
         try:
             # Load YOLO model
-            if YOLO_AVAILABLE and Path(Config.YOLO_MODEL_PATH).exists():
+            if YOLO_AVAILABLE and Config.YOLO_MODEL_PATH and Path(Config.YOLO_MODEL_PATH).exists():
                 logger.info(f"Loading YOLO model from: {Config.YOLO_MODEL_PATH}")
-                self.yolo_model = YOLO(Config.YOLO_MODEL_PATH)
+                self.yolo_model = YOLO(str(Config.YOLO_MODEL_PATH))
                 # Force CPU to avoid CUDA torchvision NMS issues
                 self.yolo_model.to('cpu')
                 logger.info("YOLO model loaded successfully (CPU mode)")
                 self.yolo_loaded = True
             else:
-                logger.warning("YOLO model not available")
+                if not YOLO_AVAILABLE:
+                    logger.warning("YOLO (ultralytics) package not available")
+                elif not Config.YOLO_MODEL_PATH:
+                    logger.warning("No YOLO model found in any expected location")
+                else:
+                    logger.warning(f"YOLO model not found at: {Config.YOLO_MODEL_PATH}")
                 self.yolo_loaded = False
                 
             # Load CRNN model
             self._load_crnn_model()
+            
+            # Load Car Type model
+            self._load_car_type_model()
             
             return True
             
@@ -250,12 +383,13 @@ class ANPRProcessor:
     def _load_crnn_model(self):
         """Load CRNN model for OCR"""
         try:
-            model_path = Config.CRNN_MODEL_PATH
-            if not Path(model_path).exists():
-                model_path = Config.CRNN_MODEL_PATH_ALT
+            if not Config.CRNN_MODEL_PATH:
+                raise FileNotFoundError("No CRNN model found in any expected location")
+                
+            model_path = str(Config.CRNN_MODEL_PATH)
                 
             if not Path(model_path).exists():
-                raise FileNotFoundError(f"CRNN model not found at either path")
+                raise FileNotFoundError(f"CRNN model not found at: {model_path}")
                 
             logger.info(f"Loading CRNN model from: {model_path}")
             
@@ -274,20 +408,59 @@ class ANPRProcessor:
             model_config = checkpoint.get('model_config', {})
             img_height = model_config.get('img_height', Config.OCR_IMG_HEIGHT)
             n_classes = model_config.get('n_classes', len(self.char_list))
-            n_hidden = model_config.get('n_hidden', 256)
+            # Force n_hidden=512 to match training architecture exactly
+            n_hidden = 512  # Training uses HIDDEN_SIZE = 512
             
-            # Detect input channels from model state dict
-            first_layer_weight = list(checkpoint['model_state_dict'].values())[0]
-            if len(first_layer_weight.shape) == 4:  # Conv2d weight tensor
-                input_channels = first_layer_weight.shape[1]
-                logger.info(f"Detected CRNN input channels: {input_channels}")
-            else:
-                input_channels = 3  # Default to 3 channels
-                logger.warning("Could not detect input channels, defaulting to 3")
+            # Force 1 channel (grayscale) to match training
+            input_channels = 1
+            logger.info(f"Using EXACT training parameters: n_hidden=512, input_channels=1, dropout=0.4")
             
-            # Initialize model
-            self.crnn_model = CustomCRNN(img_height, n_classes, n_hidden, input_channels=input_channels)
-            self.crnn_model.load_state_dict(checkpoint['model_state_dict'])
+            # Initialize model with exact training parameters
+            self.crnn_model = CustomCRNN(img_height, n_classes, n_hidden, dropout_rate=0.4, input_channels=input_channels)
+            
+            # --- Enhanced Debugging for Model Loading ---
+            model_dict = self.crnn_model.state_dict()
+            pretrained_dict = checkpoint['model_state_dict']
+            
+            logger.info(f"🔍 Loading CRNN weights. Model has {len(model_dict)} keys. Checkpoint has {len(pretrained_dict)} keys.")
+            
+            new_state_dict = {}
+            loaded_keys_count = 0
+            mismatched_shape_keys = []
+            checkpoint_only_keys = []
+
+            for k, v in pretrained_dict.items():
+                if k in model_dict:
+                    if model_dict[k].shape == v.shape:
+                        new_state_dict[k] = v
+                        loaded_keys_count += 1
+                    else:
+                        mismatched_shape_keys.append(k)
+                else:
+                    checkpoint_only_keys.append(k)
+            
+            model_only_keys = [k for k in model_dict if k not in new_state_dict]
+            
+            logger.info(f"✅ Successfully prepared to load {loaded_keys_count} / {len(model_dict)} matching keys.")
+            
+            if mismatched_shape_keys:
+                logger.warning(f"⚠️ {len(mismatched_shape_keys)} keys had mismatched shapes and were NOT loaded:")
+                for key in mismatched_shape_keys:
+                    logger.warning(f"  - Key: {key}, Model shape: {model_dict[key].shape}, Checkpoint shape: {pretrained_dict[key].shape}")
+            
+            if checkpoint_only_keys:
+                logger.warning(f"⚠️ {len(checkpoint_only_keys)} keys were in the checkpoint but NOT in the model architecture:")
+                logger.warning(f"   - {checkpoint_only_keys[:5]}...") # Log first 5
+            
+            if len(model_dict) - loaded_keys_count > 0:
+                 # Filter to show only keys that weren't matched from the pretrained_dict
+                unloaded_model_keys = [k for k in model_dict if k not in new_state_dict]
+                logger.warning(f"⚠️ {len(unloaded_model_keys)} keys in the model were NOT found in the checkpoint and will keep their initial random weights:")
+                logger.warning(f"   - {unloaded_model_keys[:5]}...")
+
+            model_dict.update(new_state_dict)
+            self.crnn_model.load_state_dict(model_dict, strict=False) # strict=False is crucial here
+            
             self.crnn_model.to(self.device)
             self.crnn_model.eval()
             
@@ -299,7 +472,57 @@ class ANPRProcessor:
             self.crnn_loaded = False
             raise
     
-    def detect_vehicles_and_plates(self, frame: np.ndarray) -> Tuple[List[Tuple[int, int, int, int]], List[Tuple[int, int, int, int]]]:
+    def _load_car_type_model(self):
+        """Load the model for car type classification."""
+        try:
+            model_path = Paths.CAR_TYPE_MODEL_PATH
+            if not model_path.exists():
+                logger.warning(f"Car type model not found at {model_path}")
+                self.car_type_model_loaded = False
+                return
+
+            logger.info(f"Loading car type model from: {model_path}")
+            self.car_type_model = torch.load(model_path, map_location=self.device)
+            self.car_type_model.to(self.device)
+            self.car_type_model.eval()
+            self.car_type_model_loaded = True
+            logger.info("Car type model loaded successfully!")
+
+        except Exception as e:
+            logger.error(f"Error loading car type model: {e}")
+            self.car_type_model_loaded = False
+
+    def detect_car_type(self, car_image: np.ndarray) -> str:
+        """Detect car type using the loaded classification model."""
+        if not self.car_type_model_loaded or self.car_type_model is None:
+            return "unknown"
+
+        try:
+            # Preprocess the car image for the model
+            transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize((ModelConfig.CAR_TYPE_INPUT_SIZE, ModelConfig.CAR_TYPE_INPUT_SIZE)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            
+            input_tensor = transform(car_image).unsqueeze(0).to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.car_type_model(input_tensor)
+                _, predicted = torch.max(outputs, 1)
+                class_index = predicted.item()
+            
+            if class_index < len(ModelConfig.CAR_TYPE_CLASSES):
+                return ModelConfig.CAR_TYPE_CLASSES[class_index]
+            else:
+                return "unknown"
+
+        except Exception as e:
+            logger.error(f"Error in detect_car_type: {e}")
+            return "unknown"
+    
+    def detect_vehicles_and_plates(self, frame: np.ndarray, frame_id: int) -> Tuple[List[Tuple[int, int, int, int]], List[Tuple[int, int, int, int]]]:
         """Detect vehicles and license plates in frame using YOLO"""
         if self.yolo_model is None:
             logger.debug("YOLO model is None, skipping detection")
@@ -307,9 +530,9 @@ class ANPRProcessor:
             
         try:
             # Force CPU inference with torch.no_grad() for efficiency
-            # Use reasonable confidence thresholds to avoid false positives
+            # Use confidence threshold from the UI for better control
             with torch.no_grad():
-                results = self.yolo_model(frame, conf=0.1, iou=Config.NMS_THRESHOLD, verbose=False, device='cpu')  # Lowered conf to 0.1 for debugging
+                results = self.yolo_model(frame, conf=Config.CONFIDENCE_THRESHOLD, iou=Config.NMS_THRESHOLD, verbose=False, device='cpu')
             
             vehicles = []
             plates = []
@@ -319,7 +542,7 @@ class ANPRProcessor:
                 boxes = result.boxes
                 if boxes is not None:
                     total_detections += len(boxes)
-                    logger.info(f"🔍 YOLO found {len(boxes)} potential detections")  # Changed to INFO for visibility
+                    logger.info(f"YOLO found {len(boxes)} potential detections")  # Changed to INFO for visibility
                     
                     for box in boxes:
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
@@ -328,23 +551,23 @@ class ANPRProcessor:
                         
                         # Filter by area and confidence
                         area = (x2 - x1) * (y2 - y1)
-                        logger.info(f"🔍 Detection: bbox=({x1},{y1},{x2},{y2}), conf={conf:.3f}, area={area}, class={cls}")
+                        logger.info(f"Detection: bbox=({x1},{y1},{x2},{y2}), conf={conf:.3f}, area={area}, class={cls}")
                         
                         # Apply stricter thresholds for better accuracy
                         if cls == 0 or cls == 1:  # Car or Motorcycle
                             # Reasonable threshold for cars
                             if conf >= 0.15:  # Lowered from 0.25 to 0.15 for debugging
                                 vehicles.append((x1, y1, x2, y2))
-                                logger.info(f"✅ Accepted car: conf={conf:.3f}, area={area}, class={cls}")
+                                logger.info(f"Accepted car: conf={conf:.3f}, area={area}, class={cls}")
                         elif cls == 2:  # License plate
                             # Lower threshold for plates to see if any are detected
                             if conf >= 0.1 and area >= 200:  # Lowered thresholds for debugging
                                 plates.append((x1, y1, x2, y2))
-                                logger.info(f"✅ Accepted license plate: conf={conf:.3f}, area={area}")
+                                logger.info(f"Accepted license plate: conf={conf:.3f}, area={area}")
                             else:
-                                logger.info(f"❌ Rejected plate: conf={conf:.3f}, area={area} (min_conf=0.1, min_area=200)")
+                                logger.info(f"Rejected plate: conf={conf:.3f}, area={area} (min_conf=0.1, min_area=200)")
                         else:
-                            logger.info(f"❓ Unknown class: {cls}, conf={conf:.3f}")
+                            logger.info(f"Unknown class: {cls}, conf={conf:.3f}")
             
             # Filter plates to only keep those near vehicles (if enabled)
             if self.vehicle_plate_association_enabled:
@@ -355,21 +578,23 @@ class ANPRProcessor:
                 logger.info(f"🔍 Vehicle-plate association disabled: keeping all {len(plates)} plates")
             
             if total_detections == 0:
-                logger.info("❌ No YOLO detections found in frame")
+                logger.info("No YOLO detections found in frame")
                 # Save frame for debugging when no detections found
                 if frame_id % 30 == 0:  # Save every 30th frame to avoid spam
                     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
                     debug_frame_path = Config.OUTPUT_DIR / f"debug_no_detections_frame_{frame_id}_{timestamp_str}.jpg"
                     cv2.imwrite(str(debug_frame_path), frame)
-                    logger.warning(f"⚠️ YOLO DEBUG: Saved frame with no detections: {debug_frame_path}")
+                    logger.warning(f"YOLO DEBUG: Saved frame with no detections: {debug_frame_path}")
             else:
-                logger.info(f"📊 YOLO SUMMARY: {total_detections} total detections, {len(vehicles)} cars, {len(plates)} plates -> {len(filtered_plates)} final plates")
+                logger.info(f"YOLO SUMMARY: {total_detections} total detections, {len(vehicles)} cars, {len(plates)} plates -> {len(filtered_plates)} final plates")
             
             return vehicles, filtered_plates
             
         except Exception as e:
-            logger.error(f"Error in plate detection: {e}")
-            return [], []
+            logger.error(f"Error processing frame {frame_id}: {e}")
+        
+        logger.debug(f"Frame {frame_id} complete: {len(detections)} new detections")
+        return detections
     
     def _filter_plates_near_vehicles(self, plates: List[Tuple[int, int, int, int]], 
                                    vehicles: List[Tuple[int, int, int, int]], 
@@ -439,71 +664,70 @@ class ANPRProcessor:
         return filtered_plates
     
     def preprocess_plate_image(self, image: np.ndarray) -> Optional[torch.Tensor]:
-        """Preprocess plate image for CRNN model"""
+        """Preprocess plate image for CRNN model - enhanced for small images"""
         try:
+            logger.info(f"🔍 PREPROCESSING: Input image shape: {image.shape}")
+            
             # Convert to grayscale if needed
             if len(image.shape) == 3:
                 gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             else:
                 gray = image
             
-            # Apply CLAHE for contrast enhancement
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
+            logger.info(f"🔍 PREPROCESSING: Grayscale shape: {gray.shape}")
+            logger.info(f"🔍 PREPROCESSING: Pixel value range: {gray.min()}-{gray.max()}")
             
-            # Denoise
-            denoised = cv2.bilateralFilter(enhanced, 9, 75, 75)
-            
-            # Adaptive threshold
-            binary = cv2.adaptiveThreshold(
-                denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-            )
-            
-            # Resize while maintaining aspect ratio
-            h, w = binary.shape
-            scale = Config.OCR_IMG_HEIGHT / h
-            new_width = int(w * scale)
-            
-            if new_width > Config.OCR_IMG_WIDTH:
-                scale = Config.OCR_IMG_WIDTH / w
-                new_height = int(h * scale)
-                new_width = Config.OCR_IMG_WIDTH
-            else:
-                new_height = Config.OCR_IMG_HEIGHT
-            
-            resized = cv2.resize(binary, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-            
-            # Create blank canvas and center the image
-            result = np.ones((Config.OCR_IMG_HEIGHT, Config.OCR_IMG_WIDTH), dtype=np.uint8) * 255
-            y_offset = (Config.OCR_IMG_HEIGHT - new_height) // 2
-            x_offset = (Config.OCR_IMG_WIDTH - new_width) // 2
-            result[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = resized
-            
-            # Convert to tensor
-            pil_image = Image.fromarray(result)
-            
-            # Check if model expects 3 channels
-            if hasattr(self, 'crnn_model') and self.crnn_model is not None:
-                expected_channels = self.crnn_model.input_channels
-            else:
-                expected_channels = 1  # Default to grayscale
+            # Check if image is too small - apply enhanced preprocessing
+            if gray.shape[0] < 40 or gray.shape[1] < 100:
+                logger.warning(f"🔍 PREPROCESSING: Image too small ({gray.shape}), applying enhanced preprocessing")
                 
-            if expected_channels == 3:
-                # Convert grayscale to RGB for 3-channel model
-                pil_image = pil_image.convert('RGB')
-                transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-                ])
+                # First, apply bilateral filter to reduce noise
+                gray = cv2.bilateralFilter(gray, 9, 75, 75)
+                
+                # Apply contrast enhancement before upscaling
+                clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
+                gray = clahe.apply(gray)
+                
+                # Use INTER_CUBIC for better quality upscaling to intermediate size
+                scale_factor = max(2, 80 // max(gray.shape[0], 1))  # Ensure minimum height of 80
+                intermediate_height = gray.shape[0] * scale_factor
+                intermediate_width = gray.shape[1] * scale_factor
+                gray = cv2.resize(gray, (intermediate_width, intermediate_height), interpolation=cv2.INTER_CUBIC)
+                
+                # Apply sharpening kernel to enhance text edges
+                kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+                gray = cv2.filter2D(gray, -1, kernel)
+                gray = np.clip(gray, 0, 255).astype(np.uint8)
+                
+                logger.info(f"🔍 PREPROCESSING: After enhancement: {gray.shape}")
             else:
-                # Keep as grayscale for 1-channel model
-                transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.5,), (0.5,))
-                ])
+                # For larger images, still apply some enhancement
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                gray = clahe.apply(gray)
+            
+            # Apply histogram equalization for better contrast
+            gray = cv2.equalizeHist(gray)
+            
+            # Final resize to target dimensions with high-quality interpolation
+            resized = cv2.resize(gray, (Config.OCR_IMG_WIDTH, Config.OCR_IMG_HEIGHT), interpolation=cv2.INTER_CUBIC)
+            
+            logger.info(f"🔍 PREPROCESSING: Final shape: {resized.shape}")
+            logger.info(f"🔍 PREPROCESSING: Final pixel range: {resized.min()}-{resized.max()}")
+            
+            # Convert to PIL Image (grayscale)
+            pil_image = Image.fromarray(resized, mode='L')
+            
+            # Apply the EXACT same transform as training
+            # Training uses: transforms.Normalize((0.5,), (0.5,)) for grayscale
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.5,), (0.5,))
+            ])
             
             tensor_image = transform(pil_image).unsqueeze(0)
-            logger.debug(f"Preprocessed image shape: {tensor_image.shape}, expected channels: {expected_channels}")
+            logger.info(f"🔍 PREPROCESSING: Tensor shape: {tensor_image.shape}")
+            logger.info(f"🔍 PREPROCESSING: Tensor range: {tensor_image.min().item():.3f} to {tensor_image.max().item():.3f}")
+            
             return tensor_image
             
         except Exception as e:
@@ -513,16 +737,44 @@ class ANPRProcessor:
     def decode_ctc_predictions(self, outputs) -> Tuple[List[str], List[float]]:
         """Decode CTC predictions to text"""
         try:
+            # Add detailed debugging
+            logger.info(f"🔍 CTC DEBUG: Input outputs shape: {outputs.shape}")
+            logger.info(f"🔍 CTC DEBUG: Input outputs dtype: {outputs.dtype}")
+            logger.info(f"🔍 CTC DEBUG: Character list size: {len(self.char_list) if self.char_list else 'None'}")
+            
+            # Check if outputs are valid
+            if torch.isnan(outputs).any():
+                logger.warning("🔍 CTC DEBUG: NaN values detected in outputs!")
+            if torch.isinf(outputs).any():
+                logger.warning("🔍 CTC DEBUG: Inf values detected in outputs!")
+            
+            # Apply softmax and get predictions
+            probs = torch.softmax(outputs, dim=2)
             preds_idx = torch.argmax(outputs, dim=2)
+            
+            logger.info(f"🔍 CTC DEBUG: Predictions shape: {preds_idx.shape}")
+            logger.info(f"🔍 CTC DEBUG: Max prediction index: {preds_idx.max().item()}")
+            logger.info(f"🔍 CTC DEBUG: Min prediction index: {preds_idx.min().item()}")
+            
+            # Check if predictions are reasonable
+            if preds_idx.max().item() >= len(self.char_list):
+                logger.error(f"🔍 CTC DEBUG: Prediction index {preds_idx.max().item()} exceeds character list size {len(self.char_list)}")
+            
+            # Show first few predictions for debugging
+            first_seq = preds_idx[:10, 0].cpu().numpy()  # First 10 timesteps of first batch
+            logger.info(f"🔍 CTC DEBUG: First 10 predictions: {first_seq}")
+            
             preds_idx = preds_idx.transpose(0, 1).cpu().numpy()
             
             decoded_texts = []
             confidences = []
-            probs = torch.softmax(outputs, dim=2).transpose(0, 1).cpu().detach().numpy()
+            probs = probs.transpose(0, 1).cpu().detach().numpy()
             
             for i in range(preds_idx.shape[0]):
                 batch_preds = preds_idx[i]
                 batch_probs = probs[i]
+                
+                logger.info(f"🔍 CTC DEBUG: Processing batch {i}, sequence length: {len(batch_preds)}")
                 
                 text = []
                 char_confidence = []
@@ -530,40 +782,58 @@ class ANPRProcessor:
                 
                 for t in range(len(batch_preds)):
                     char_idx = batch_preds[t]
+                    
+                    # Debug each character prediction
+                    if t < 10:  # Only log first 10 for brevity
+                        char_name = self.char_list[char_idx] if char_idx < len(self.char_list) else f"INVALID_{char_idx}"
+                        logger.info(f"🔍 CTC DEBUG: t={t}, char_idx={char_idx}, char='{char_name}', prob={batch_probs[t, char_idx]:.4f}")
+                    
+                    # CTC decoding: skip blanks (index 0) and repeated characters
                     if char_idx != 0 and char_idx != last_char_idx:
                         if char_idx < len(self.char_list):
-                            text.append(self.char_list[char_idx])
+                            character = self.char_list[char_idx]
+                            text.append(character)
                             char_confidence.append(batch_probs[t, char_idx])
+                            logger.info(f"🔍 CTC DEBUG: Added character '{character}' at position {t}")
+                        else:
+                            logger.warning(f"🔍 CTC DEBUG: Invalid character index {char_idx} at position {t}")
+                    
                     last_char_idx = char_idx
                 
-                decoded_texts.append("".join(text))
+                final_text = "".join(text)
                 avg_conf = np.mean(char_confidence) if char_confidence else 0.0
+                
+                logger.info(f"🔍 CTC DEBUG: Final decoded text: '{final_text}' (confidence: {avg_conf:.4f})")
+                
+                decoded_texts.append(final_text)
                 confidences.append(avg_conf)
             
             return decoded_texts, confidences
             
         except Exception as e:
             logger.error(f"Error decoding predictions: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return [], []
     
     def recognize_plate_text(self, plate_image: np.ndarray) -> Tuple[Optional[str], float]:
         """Recognize text from plate image using CRNN"""
         if self.crnn_model is None or self.char_list is None:
-            logger.info("❌ CRNN model or character list not available")
+            logger.info("CRNN model or character list not available")
             return None, 0.0
             
         try:
-            logger.info(f"🔍 OCR: Processing plate image of shape: {plate_image.shape}")
+            logger.info(f"OCR: Processing plate image of shape: {plate_image.shape}")
             
             # Quality check: reject images that are too small or have poor quality
             if not self._is_good_plate_image(plate_image):
-                logger.info("❌ OCR: Plate image quality check failed")
+                logger.info("OCR: Plate image quality check failed")
                 return None, 0.0
             
             # Preprocess image
             tensor_image = self.preprocess_plate_image(plate_image)
             if tensor_image is None:
-                logger.info("❌ OCR: Image preprocessing failed")
+                logger.info("OCR: Image preprocessing failed")
                 return None, 0.0
             
             # Move to device
@@ -572,26 +842,34 @@ class ANPRProcessor:
             # Run inference
             with torch.no_grad():
                 outputs = self.crnn_model(tensor_image)
-                logger.info(f"🔍 OCR: CRNN outputs shape: {outputs.shape}")
+                
+                # Handle tuple output from new architecture (CTC output, attention output)
+                if isinstance(outputs, tuple):
+                    ctc_outputs, _ = outputs  # We only need CTC outputs for inference
+                    outputs = ctc_outputs
+                
+                logger.info(f"OCR: CRNN outputs shape: {outputs.shape}")
                 decoded_texts, confidences = self.decode_ctc_predictions(outputs)
             
-            logger.info(f"🔍 OCR: Decoded texts: {decoded_texts}, confidences: {confidences}")
+            logger.info(f"OCR: Decoded texts: {decoded_texts}, confidences: {confidences}")
             
             if decoded_texts and confidences:
                 text = decoded_texts[0].upper().replace(" ", "")
                 confidence = confidences[0]
                 
-                logger.info(f"🔍 OCR: Raw result: '{text}' (conf: {confidence:.3f})")
+                logger.info(f"OCR: Raw result: '{text}' (conf: {confidence:.3f})")
                 
                 # Validate text (basic license plate pattern)
-                if self._validate_plate_text(text) and confidence >= Config.MIN_OCR_CONFIDENCE:
-                    logger.info(f"✅ OCR: Result accepted: '{text}' (conf: {confidence:.3f})")
+                # Temporarily lower confidence threshold for testing preprocessing fix
+                min_conf_threshold = 0.3  # Lowered from Config.MIN_OCR_CONFIDENCE (0.85)
+                if self._validate_plate_text(text) and confidence >= min_conf_threshold:
+                    logger.info(f"OCR: Result accepted: '{text}' (conf: {confidence:.3f})")
                     return text, confidence
                 else:
-                    logger.info(f"❌ OCR: Result rejected: '{text}' (conf: {confidence:.3f}, min_conf: {Config.MIN_OCR_CONFIDENCE})")
-                    logger.info(f"❌ OCR: Validation passed: {self._validate_plate_text(text)}, Confidence check: {confidence >= Config.MIN_OCR_CONFIDENCE}")
+                    logger.info(f"OCR: Result rejected: '{text}' (conf: {confidence:.3f}, min_conf: {min_conf_threshold})")
+                    logger.info(f"OCR: Validation passed: {self._validate_plate_text(text)}, Confidence check: {confidence >= min_conf_threshold}")
             else:
-                logger.info("❌ OCR: No decoded texts or confidences")
+                logger.info("OCR: No decoded texts or confidences")
             
             return None, 0.0
             
@@ -727,90 +1005,63 @@ class ANPRProcessor:
         return False
     
     def detect_plate_type(self, plate_image: np.ndarray) -> str:
-        """
-        Detect the type/color of license plate (green, white, red)
-        Simple and robust approach to avoid false blue detection
-        
-        Args:
-            plate_image: The cropped license plate image
-            
-        Returns:
-            str: "green", "white", "red", or "unknown"
-        """
         try:
             if plate_image is None or plate_image.size == 0:
                 return "unknown"
-            
-            # Convert BGR to RGB for color analysis (OpenCV uses BGR)
             if len(plate_image.shape) == 3:
                 rgb_image = cv2.cvtColor(plate_image, cv2.COLOR_BGR2RGB)
             else:
                 rgb_image = cv2.cvtColor(plate_image, cv2.COLOR_GRAY2RGB)
-            
-            # Convert to HSV for better color detection
             hsv_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
-            
-            height, width = hsv_image.shape[:2]
+            height, width, _ = hsv_image.shape
             if height < 15 or width < 30:
                 return "unknown"
-            
-            # Get average colors from entire image (simple approach)
-            avg_hue = np.mean(hsv_image[:, :, 0])
-            avg_saturation = np.mean(hsv_image[:, :, 1])
-            avg_value = np.mean(hsv_image[:, :, 2])
-            
-            # RGB analysis
-            avg_r = np.mean(rgb_image[:, :, 0])
-            avg_g = np.mean(rgb_image[:, :, 1])
-            avg_b = np.mean(rgb_image[:, :, 2])
-            
-            logger.info(f"🎨 SIMPLE COLOR ANALYSIS: H={avg_hue:.1f}, S={avg_saturation:.1f}, V={avg_value:.1f}")
-            logger.info(f"🎨 RGB VALUES: R={avg_r:.1f}, G={avg_g:.1f}, B={avg_b:.1f}")
-            
-            # EXPLICIT LOGIC TO PREVENT BLUE FALSE POSITIVES
-            
-            # 1. WHITE DETECTION (HIGHEST PRIORITY)
-            # White plates have low saturation and high brightness
-            # OR balanced high RGB values
-            if (avg_saturation < 40 and avg_value > 130) or \
-               (avg_r > 140 and avg_g > 140 and avg_b > 140 and \
-                abs(avg_r - avg_g) < 40 and abs(avg_g - avg_b) < 40):
-                logger.info(f"✅ WHITE PLATE DETECTED: Low saturation ({avg_saturation:.1f}) or balanced RGB")
-                return "white"
-            
-            # 2. GREEN DETECTION (SECOND PRIORITY)
-            # Green plates have green hue OR green channel dominance
-            if (45 <= avg_hue <= 75 and avg_saturation > 25) or \
-               (avg_g > avg_r * 1.2 and avg_g > avg_b * 1.2 and avg_g > 80):
-                logger.info(f"✅ GREEN PLATE DETECTED: Hue={avg_hue:.1f} or G-dominant={avg_g:.1f}")
+            mask = cv2.inRange(hsv_image, np.array([0, 0, 50]), np.array([180, 255, 220]))
+            mask_percentage = np.sum(mask > 0) / (height * width)
+            if mask_percentage < 0.2:
+                hsv_pixels = hsv_image.reshape(-1, 3)
+                rgb_pixels = rgb_image.reshape(-1, 3)
+            else:
+                hsv_pixels = hsv_image[mask > 0]
+                rgb_pixels = rgb_image[mask > 0]
+            if rgb_pixels.size == 0:
+                return "unknown"
+            avg_hue = np.mean(hsv_pixels[:, 0])
+            avg_saturation = np.mean(hsv_pixels[:, 1])
+            avg_value = np.mean(hsv_pixels[:, 2])
+            avg_r = np.mean(rgb_pixels[:, 0])
+            avg_g = np.mean(rgb_pixels[:, 1])
+            avg_b = np.mean(rgb_pixels[:, 2])
+            # --- AGGRESSIVE GREEN DETECTION ---
+            green_dominance = (avg_g > avg_r * 1.10) and (avg_g > avg_b * 1.10) and (avg_g > 60)
+            green_hue = 35 <= avg_hue <= 95
+            pale_green = green_dominance and green_hue
+            if pale_green:
                 return "green"
-            
-            # 3. RED DETECTION
-            # Red plates have red hue OR red channel dominance
-            if ((avg_hue <= 15 or avg_hue >= 165) and avg_saturation > 30) or \
-               (avg_r > avg_g * 1.3 and avg_r > avg_b * 1.3 and avg_r > 90):
-                logger.info(f"✅ RED PLATE DETECTED: Hue={avg_hue:.1f} or R-dominant={avg_r:.1f}")
+            # --- WHITE/GRAY ---
+            rgb_max = max(avg_r, avg_g, avg_b)
+            rgb_min = min(avg_r, avg_g, avg_b)
+            rgb_diff = rgb_max - rgb_min
+            if rgb_diff < 35:
+                if avg_value > 150:
+                    return "white"
+                elif avg_value < 70:
+                    return "unknown"
+                else:
+                    return "white"
+            # --- OTHER COLORS ---
+            if ((avg_hue <= 15 or avg_hue >= 165) and avg_saturation > 40) or \
+               (avg_r > avg_g * 1.25 and avg_r > avg_b * 1.25 and avg_r > 80):
                 return "red"
-            
-            # 4. YELLOW DETECTION
-            if (20 <= avg_hue <= 40 and avg_saturation > 35):
-                logger.info(f"✅ YELLOW PLATE DETECTED: Hue={avg_hue:.1f}")
+            if (20 <= avg_hue <= 40 and avg_saturation > 40):
                 return "yellow"
-            
-            # 5. BLUE DETECTION - EXTREMELY STRICT TO PREVENT FALSE POSITIVES
-            # ONLY detect as blue if it's CLEARLY blue and NOT white/green
-            if (105 <= avg_hue <= 125 and avg_saturation > 60 and avg_value > 100) and \
-               (avg_b > avg_r * 1.5 and avg_b > avg_g * 1.5 and avg_b > 100) and \
-               not (avg_r > 120 and avg_g > 120):  # Ensure it's not white-ish
-                logger.info(f"✅ BLUE PLATE DETECTED (STRICT): Hue={avg_hue:.1f}, B-dominant={avg_b:.1f}")
+            if (100 <= avg_hue <= 130 and avg_saturation > 50) and \
+               (avg_b > avg_r * 1.4 and avg_b > avg_g * 1.4 and avg_b > 90):
                 return "blue"
-            
-            # If none of the above, return unknown
-            logger.info(f"❓ UNKNOWN PLATE COLOR: H={avg_hue:.1f}, S={avg_saturation:.1f}, V={avg_value:.1f}")
+            if avg_saturation < 25:
+                return "white"
             return "unknown"
-                
         except Exception as e:
-            logger.error(f"Error detecting plate type: {e}")
             return "unknown"
     
     def get_plate_type_emoji(self, plate_type: str) -> str:
@@ -824,6 +1075,156 @@ class ANPRProcessor:
             "unknown": "⚫"
         }
         return type_emojis.get(plate_type, "⚫")
+    
+    def detect_car_color(self, car_image: np.ndarray) -> str:
+        """
+        Detect the dominant color of a car using HSV color space analysis
+        
+        Args:
+            car_image: The cropped car image
+            
+        Returns:
+            str: Detected color name
+        """
+        try:
+            if car_image is None or car_image.size == 0:
+                return "unknown"
+            
+            # Convert BGR to HSV for better color detection
+            hsv = cv2.cvtColor(car_image, cv2.COLOR_BGR2HSV)
+            
+            # Focus on the middle part of the car (avoid shadows and reflections)
+            h, w = hsv.shape[:2]
+            center_h_start = int(h * 0.2)
+            center_h_end = int(h * 0.8)
+            center_w_start = int(w * 0.1)
+            center_w_end = int(w * 0.9)
+            
+            center_region = hsv[center_h_start:center_h_end, center_w_start:center_w_end]
+            
+            # Calculate histogram for hue channel
+            hist = cv2.calcHist([center_region], [0], None, [180], [0, 180])
+            
+            # Find dominant hue
+            dominant_hue = np.argmax(hist)
+            
+            # Get saturation and value for better color classification
+            avg_saturation = np.mean(center_region[:, :, 1])
+            avg_value = np.mean(center_region[:, :, 2])
+            
+            # Color classification based on HSV values
+            if avg_saturation < 30:  # Low saturation = grayscale colors
+                if avg_value < 60:
+                    return "black"
+                elif avg_value < 130:
+                    return "gray"
+                else:
+                    return "white"
+            
+            # High saturation colors
+            if 0 <= dominant_hue <= 10 or 170 <= dominant_hue <= 180:
+                return "red"
+            elif 11 <= dominant_hue <= 25:
+                return "orange"
+            elif 26 <= dominant_hue <= 35:
+                return "yellow"
+            elif 36 <= dominant_hue <= 85:
+                return "green"
+            elif 86 <= dominant_hue <= 125:
+                return "blue"
+            elif 126 <= dominant_hue <= 140:
+                return "purple"
+            elif 141 <= dominant_hue <= 169:
+                return "pink"
+            else:
+                return "unknown"
+                
+        except Exception as e:
+            logger.error(f"Error detecting car color: {e}")
+            return "unknown"
+    
+    def detect_car_model(self, car_image: np.ndarray) -> str:
+        """
+        Detect car model/type using basic shape and feature analysis
+        
+        Args:
+            car_image: The cropped car image
+            
+        Returns:
+            str: Detected car type (sedan, suv, hatchback, etc.)
+        """
+        try:
+            if car_image is None or car_image.size == 0:
+                return "unknown"
+            
+            h, w = car_image.shape[:2]
+            aspect_ratio = w / h
+            
+            # Convert to grayscale for edge detection
+            gray = cv2.cvtColor(car_image, cv2.COLOR_BGR2GRAY)
+            
+            # Edge detection to analyze car shape
+            edges = cv2.Canny(gray, 50, 150)
+            
+            # Analyze car proportions and features
+            # Basic classification based on aspect ratio and height
+            if aspect_ratio > 2.5:
+                # Very wide vehicles
+                if h < 80:
+                    return "sports_car"
+                else:
+                    return "limousine"
+            elif aspect_ratio > 2.0:
+                # Standard wide vehicles
+                if h < 100:
+                    return "sedan"
+                else:
+                    return "suv"
+            elif aspect_ratio > 1.5:
+                # Compact vehicles
+                if h < 90:
+                    return "hatchback"
+                else:
+                    return "crossover"
+            elif aspect_ratio > 1.2:
+                # Tall vehicles
+                return "van"
+            else:
+                # Very tall or square vehicles
+                return "truck"
+                
+        except Exception as e:
+            logger.error(f"Error detecting car model: {e}")
+            return "unknown"
+    
+    def get_car_color_emoji(self, color: str) -> str:
+        """Get emoji representation for car color"""
+        color_emojis = {
+            "red": "🔴",
+            "blue": "🔵", 
+            "green": "🟢",
+            "yellow": "🟡",
+            "orange": "🟠",
+            "purple": "🟣",
+            "pink": "🩷",
+            "black": "⚫",
+            "white": "⚪",
+            "gray": "🔘",
+            "unknown": "❓"
+        }
+        return color_emojis.get(color, "❓")
+    
+    def get_car_model_emoji(self, model: str) -> str:
+        """Get emoji representation for car model"""
+        model_emojis = {
+            "sedan": "🚗",
+            "suv": "🚙",
+            "hatchback": "🚗",
+            "van": "🚐",
+            "truck": "🚚",
+            "unknown": "❓"
+        }
+        return model_emojis.get(model, "❓")
     
     def is_unique_plate_detection(self, text: str, timestamp: float) -> bool:
         """Check if this is a unique plate detection (not a continuous sequence)"""
@@ -896,6 +1297,63 @@ class ANPRProcessor:
         
         return previous_row[-1]
     
+    def get_consensus_plate_text(self, text: str, timestamp: float) -> str:
+        """
+        Stabilizes OCR results by grouping similar plate texts and finding a consensus.
+        This prevents flickering between visually similar characters (e.g., Q and D).
+        """
+        # 1. Cleanup old, expired plate groups that haven't been seen recently
+        expired_keys = [
+            k for k, v in self.plate_groups.items() 
+            if timestamp - v['last_seen'] > self.plate_group_expiry_seconds
+        ]
+        for k in expired_keys:
+            del self.plate_groups[k]
+
+        # 2. Find the best matching existing plate group for the new text
+        best_match_key = None
+        min_dist = self.plate_group_similarity_threshold + 1
+        
+        for key in self.plate_groups.keys():
+            # Only compare if lengths are similar to avoid mismatches
+            if abs(len(text) - len(key)) <= self.plate_group_similarity_threshold:
+                dist = self._levenshtein_distance(text, key)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_match_key = key
+
+        # 3. If a close match is found, update the group and return the consensus text
+        if best_match_key and min_dist <= self.plate_group_similarity_threshold:
+            group = self.plate_groups[best_match_key]
+            group['last_seen'] = timestamp
+            
+            # Update character counts for voting, only if text length is consistent
+            if len(text) == len(group['char_counts']):
+                for i, char in enumerate(text):
+                    group['char_counts'][i][char] += 1
+            
+            # Generate the consensus text by taking the most frequent character at each position
+            consensus_text = ""
+            for char_map in group['char_counts']:
+                if char_map:
+                    consensus_text += max(char_map, key=char_map.get)
+            
+            return consensus_text
+        
+        # 4. If no group is found, create a new one for this plate text
+        else:
+            char_counts = []
+            for char in text:
+                dd = defaultdict(int)
+                dd[char] = 1
+                char_counts.append(dd)
+            
+            self.plate_groups[text] = {
+                'last_seen': timestamp,
+                'char_counts': char_counts
+            }
+            return text
+
     def process_frame(self, frame: np.ndarray, frame_id: int) -> List[Detection]:
         """Process a single frame and return detections"""
         detections = []
@@ -909,7 +1367,7 @@ class ANPRProcessor:
             should_process_ocr = (self.frame_skip_counter % self.process_every_n_frames == 0)
             
             # Always detect cars and plates for display, but limit OCR processing
-            vehicle_boxes, plate_boxes = self.detect_vehicles_and_plates(frame)
+            vehicle_boxes, plate_boxes = self.detect_vehicles_and_plates(frame, frame_id)
             logger.debug(f"Frame {frame_id}: Found {len(vehicle_boxes)} cars, {len(plate_boxes)} plate boxes")
             
             # Log every 10th frame for debugging
@@ -929,17 +1387,40 @@ class ANPRProcessor:
                     if should_process_ocr:  # Save only when processing
                         self._save_detection(frame, parked_detection)
             
-            # Add regular car detections (for display only, save less frequently)
+            # Add regular car detections with color and model analysis
             for i, bbox in enumerate(vehicle_boxes):
+                x1, y1, x2, y2 = bbox
+                car_region = frame[y1:y2, x1:x2]
+                
+                # Detect car color and model
+                car_color = "unknown"
+                car_model = "unknown"
+                
+                if should_process_ocr and car_region.size > 0:
+                    car_color = self.detect_car_color(car_region)
+                    car_model = self.detect_car_type(car_region)
+                
+                # Create car detection with enhanced info
+                car_text = f"({car_color.title()}) ({car_model.title()})"
+                
                 detection = Detection(
-                    text="Car",
+                    text=car_text,
                     confidence=0.0,  # We don't track car confidence separately
                     bbox=bbox,
                     timestamp=timestamp,
                     frame_id=frame_id,
-                    detection_type="car"
+                    detection_type="car",
+                    car_color=car_color,
+                    car_model=car_model
                 )
                 detections.append(detection)
+                
+                # Update car color and model statistics (only when processing)
+                if should_process_ocr:
+                    if car_color in self.car_color_counts:
+                        self.car_color_counts[car_color] += 1
+                    if car_model in self.car_model_counts:
+                        self.car_model_counts[car_model] += 1
                 
                 # Save car detection image only occasionally to reduce I/O
                 if should_process_ocr and i == 0:  # Save only first car per processing cycle
@@ -966,6 +1447,11 @@ class ANPRProcessor:
                     logger.debug(f"Plate {i+1}: OCR result: '{text}' (conf: {ocr_confidence:.3f})")
                     
                     if text:
+                        original_text = text
+                        text = self.get_consensus_plate_text(text, timestamp)
+                        if original_text != text:
+                            logger.info(f"Plate text corrected from '{original_text}' to '{text}' using consensus.")
+
                         # Detect plate type/color
                         plate_type = self.detect_plate_type(plate_region)
                         logger.info(f"🎨 Plate {i+1}: Type detected: {plate_type.upper()}")
@@ -1068,7 +1554,7 @@ class ANPRProcessor:
     def process_frame_with_zone(self, frame: np.ndarray, frame_id: int, detection_zone: List[Tuple[int, int]]) -> List[Detection]:
         """Process frame with stateful zone crossing based on precise line crossing."""
         try:
-            vehicles, plates = self.detect_vehicles_and_plates(frame)
+            vehicles, plates = self.detect_vehicles_and_plates(frame, frame_id)
             timestamp = time.time()
 
             entry_line = detection_zone[:2]
@@ -1145,7 +1631,20 @@ class ANPRProcessor:
                     logger.info(f"🚗 Vehicle {vehicle_id} is IN the zone (crossed entry line but not exit line).")
                     logger.info(f"🚗 Vehicle bbox: ({x1},{y1},{x2},{y2}), center: ({center_x},{center_y})")
                     
-                    in_zone_detection = Detection("Car (In-Zone)", 0.0, bbox, timestamp, frame_id, "car")
+                    # Detect car color and model for in-zone vehicles
+                    car_region = frame[y1:y2, x1:x2]
+                    car_color = "unknown"
+                    car_model = "unknown"
+                    
+                    if car_region.size > 0:
+                        car_color = self.detect_car_color(car_region)
+                        car_model = self.detect_car_type(car_region)
+                    
+                    color_emoji = self.get_car_color_emoji(car_color)
+                    model_emoji = self.get_car_model_emoji(car_model)
+                    car_text = f"Vehicle (In-Zone)" # Simplified for clarity
+                    
+                    in_zone_detection = Detection(car_text, 0.0, bbox, timestamp, frame_id, "car", car_color=car_color, car_model=car_model)
                     detections_in_zone.append(in_zone_detection)
                     
                     # OCR on associated plates within the vehicle's bounding box
@@ -1201,8 +1700,14 @@ class ANPRProcessor:
                                 logger.info(f"💾 ZONE DEBUG: Saved plate region to {debug_plate_path}")
                             
                             text, conf = self.recognize_plate_text(plate_region)
-                            logger.info(f"🔍 ZONE OCR: Result: '{text}' (conf: {conf:.3f})")
+                            logger.info(f"🔍 ZONE OCR: Raw result: '{text}' (conf: {conf:.3f})")
                             
+                            if text:
+                                original_text = text
+                                text = self.get_consensus_plate_text(text, timestamp)
+                                if original_text != text:
+                                    logger.info(f"Corrected plate text from '{original_text}' to '{text}' using consensus.")
+
                             # ENHANCED DEBUGGING: Lower confidence threshold and detailed logging
                             logger.info(f"🔍 ZONE DEBUG: OCR text='{text}', conf={conf:.3f}, min_conf={Config.MIN_OCR_CONFIDENCE}")
                             logger.info(f"🔍 ZONE DEBUG: Already processed: {text in self.zone_processed_plates if text else 'N/A'}")
@@ -1782,7 +2287,9 @@ class VideoThread(QThread):
                     logger.error(f"Failed to configure camera {self.camera_index}")
                     cap = cv2.VideoCapture(self.camera_index)  # Fallback to basic camera
             else:
+                logger.info(f"Opening video file: {self.source_path}")
                 cap = cv2.VideoCapture(self.source_path)
+                logger.info(f"Video capture created, isOpened: {cap.isOpened()}")
             
             self.cap = cap  # Store reference for seeking
             
@@ -1845,7 +2352,12 @@ class VideoThread(QThread):
                         self.anpr_processor.saved_car_plates.clear()
                         continue
                     else:
+                        logger.warning(f"Failed to read frame from {self.source_type}")
                         break
+                
+                # Log frame reading success periodically
+                if self.frame_count % 30 == 0:  # Every 30 frames
+                    logger.info(f"Reading frame {self.frame_count}, shape: {frame.shape}")
                 
                 # Process frame
                 if self.detection_point:
@@ -1865,7 +2377,11 @@ class VideoThread(QThread):
                     'parked_cars': len(self.anpr_processor.parked_cars) if hasattr(self.anpr_processor, 'parked_cars') else 0,
                     'white_plates': self.anpr_processor.plate_type_counts.get('white', 0),
                     'green_plates': self.anpr_processor.plate_type_counts.get('green', 0),
-                    'red_plates': self.anpr_processor.plate_type_counts.get('red', 0)
+                    'red_plates': self.anpr_processor.plate_type_counts.get('red', 0),
+                    'total_car_colors': sum(self.anpr_processor.car_color_counts.values()),
+                    'total_car_models': sum(self.anpr_processor.car_model_counts.values()),
+                    'car_colors': self.anpr_processor.car_color_counts,
+                    'car_models': self.anpr_processor.car_model_counts
                 }
                 self.stats_updated.emit(stats)
                 
@@ -2109,7 +2625,9 @@ class MainWindow(QMainWindow):
             'parked': QLabel("Parked cars: 0"),
             'white_plates': QLabel("⚪ White plates: 0"),
             'green_plates': QLabel("🟢 Green plates: 0"),
-            'red_plates': QLabel("🔴 Red plates: 0")
+            'red_plates': QLabel("🔴 Red plates: 0"),
+            'total_car_colors': QLabel("🎨 Car colors detected: 0"),
+            'total_car_models': QLabel("🚗 Car models detected: 0")
         }
         
         for label in self.stats_labels.values():
@@ -2437,11 +2955,22 @@ class MainWindow(QMainWindow):
             if source_type == 'video':
                 if hasattr(self, 'video_file_path'):
                     source_path = self.video_file_path
+                    logger.info(f"Using selected video file: {source_path}")
+                    
+                    # Test if video file can be opened before starting thread
+                    test_cap = cv2.VideoCapture(source_path)
+                    if not test_cap.isOpened():
+                        logger.error(f"Cannot open video file: {source_path}")
+                        test_cap.release()
+                        return
+                    test_cap.release()
+                    logger.info("Video file test successful")
                 else:
                     # Use default video path
                     video_files = list(Path(Config.VIDEO_PATH).glob("*.mp4"))
                     if video_files:
                         source_path = str(video_files[0])
+                        logger.info(f"Using default video file: {source_path}")
                     else:
                         logger.error("No video file selected or found")
                         return
@@ -2456,8 +2985,9 @@ class MainWindow(QMainWindow):
             
             if detection_mode == "Zone-based Detection":
                 detection_point = self.detection_points if self.points_complete else None
-                if not detection_point or len(detection_point) != 2:
-                    logger.warning("Zone-based detection selected but detection line not complete!")
+                if not detection_point or len(detection_point) != 4:
+                    logger.warning("Zone-based detection selected but detection zone not complete!")
+                    detection_point = None  # Set to None to fall back to regular detection
             elif detection_mode == "Parking Vehicle Detection":
                 parking_enabled = True
             # Real-time Detection uses default settings
@@ -2604,9 +3134,8 @@ class MainWindow(QMainWindow):
                 # Choose colors based on detection type
                 if detection.detection_type == "car":
                     box_color = (255, 0, 0)  # Blue for cars
-                    label = "Car"
+                    label = detection.text  # Use enhanced text with emojis and car info
                     if "In-Zone" in detection.text:
-                        label = "Car (In-Zone)"
                         box_color = (255, 200, 0) # Light Blue for in-zone cars
                     show_confidence = False
                 elif detection.detection_type == "parked_car":
@@ -2689,6 +3218,12 @@ class MainWindow(QMainWindow):
                 self.stats_labels['green_plates'].setText(f"🟢 Green plates: {stats['green_plates']}")
             if 'red_plates' in stats:
                 self.stats_labels['red_plates'].setText(f"🔴 Red plates: {stats['red_plates']}")
+            
+            # Update car color and model statistics
+            if 'total_car_colors' in stats:
+                self.stats_labels['total_car_colors'].setText(f"🎨 Car colors detected: {stats['total_car_colors']}")
+            if 'total_car_models' in stats:
+                self.stats_labels['total_car_models'].setText(f"🚗 Car models detected: {stats['total_car_models']}")
             
         except Exception as e:
             logger.error(f"Error updating stats: {e}")
@@ -3170,13 +3705,19 @@ class MainWindow(QMainWindow):
             self.current_detections.clear()
             self.detections_text.clear()
             
-            # Also clear the saved car plates tracking and plate type statistics
+            # Also clear the saved car plates tracking and all statistics
             if self.video_thread and hasattr(self.video_thread, 'anpr_processor'):
                 self.video_thread.anpr_processor.saved_car_plates.clear()
                 # Reset plate type statistics
                 for plate_type in self.video_thread.anpr_processor.plate_type_counts:
                     self.video_thread.anpr_processor.plate_type_counts[plate_type] = 0
-                logger.info("Cleared saved car plates tracking and plate type statistics")
+                # Reset car color statistics
+                for color in self.video_thread.anpr_processor.car_color_counts:
+                    self.video_thread.anpr_processor.car_color_counts[color] = 0
+                # Reset car model statistics
+                for model in self.video_thread.anpr_processor.car_model_counts:
+                    self.video_thread.anpr_processor.car_model_counts[model] = 0
+                logger.info("Cleared saved car plates tracking and all statistics")
             
             logger.info("Detection history cleared")
         except Exception as e:
@@ -3185,7 +3726,7 @@ class MainWindow(QMainWindow):
     def update_live_feed(self):
         """Update the live feed of detections"""
         try:
-            logger.info(f"📺 LIVE FEED: Updating with {len(self.all_detections_history)} total detections in history")
+            logger.info(f"LIVE FEED: Updating with {len(self.all_detections_history)} total detections in history")
             
             if self.all_detections_history:
                 # Show all plate detections (remove confidence filtering)
@@ -3194,7 +3735,7 @@ class MainWindow(QMainWindow):
                     if d.detection_type == "plate" and d.text not in ["Car", "Plate"]
                 ]
                 
-                logger.info(f"📺 LIVE FEED: Found {len(visible_detections)} visible plate detections")
+                logger.info(f"LIVE FEED: Found {len(visible_detections)} visible plate detections")
                 
                 # Show last 15 visible detections for live feed
                 recent_detections = visible_detections[-15:]
@@ -3231,11 +3772,11 @@ class MainWindow(QMainWindow):
                 scrollbar = self.detections_text.verticalScrollBar()
                 scrollbar.setValue(scrollbar.maximum())
                 
-                logger.info(f"📺 LIVE FEED: Updated display with {len(recent_detections)} recent detections")
+                logger.info(f"LIVE FEED: Updated display with {len(recent_detections)} recent detections")
             else:
                 # Show waiting message when no detections
                 self.detections_text.setPlainText("═══ LIVE DETECTION FEED ═══\n\nWaiting for license plate detections...")
-                logger.info("📺 LIVE FEED: No detections in history, showing waiting message")
+                logger.info("LIVE FEED: No detections in history, showing waiting message")
                 
         except Exception as e:
             logger.error(f"Error updating live feed: {e}")

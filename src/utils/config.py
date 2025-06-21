@@ -29,13 +29,16 @@ class Paths:
     YOLO_LAST_MODEL = YOLO_WEIGHTS_DIR / "weights" / "last.pt"
     YOLO_CONFIG_PATH = PROJECT_ROOT / "config" / "data.yaml"
     
-    # CRNN model paths
-    CRNN_WEIGHTS_DIR = OCR_MODELS / "crnn_v1"
-    CRNN_MODEL_PATH = CRNN_WEIGHTS_DIR / "best_multiline_crnn_epoch292_acc0.9304.pth"
-    CRNN_MODEL_PATH_ALT = CRNN_WEIGHTS_DIR / "checkpoint_epoch_310_acc0.923.pth"
+    # CRNN model paths (Updated to crnn_v2 with higher accuracy model)
+    CRNN_WEIGHTS_DIR = OCR_MODELS / "crnn_v2"
+    CRNN_MODEL_PATH = CRNN_WEIGHTS_DIR / "best_multiline_crnn_epoch51_acc0.9966.pth"
+    CRNN_MODEL_PATH_ALT = CRNN_WEIGHTS_DIR / "checkpoint_epoch_70_acc0.996.pth"
     CRNN_CHARS_FILE = DATA_DIR / "processed" / "all_chars.txt"
     
-    # Output directories
+    # Car type model path
+    CAR_TYPE_MODEL_PATH = DETECTION_MODELS / "model_type" / "best_car_model.pt"
+    
+    # Output directoriesWW
     OUTPUT_DIR = PROJECT_ROOT / "outputs"
     DETECTED_PLATES_DIR = OUTPUT_DIR / "detected_plates"
     LOGS_DIR = OUTPUT_DIR / "logs"
@@ -61,6 +64,10 @@ class ModelConfig:
     OCR_MIN_CONFIDENCE = 0.85
     OCR_HIDDEN_SIZE = 256
     OCR_DROPOUT_RATE = 0.3
+    
+    # Car Type Model Configuration
+    CAR_TYPE_INPUT_SIZE = 224
+    CAR_TYPE_CLASSES = ['sedan', 'suv', 'hatchback', 'van', 'truck', 'unknown']
     
     # Training Configuration
     TRAIN_EPOCHS = 200
@@ -107,6 +114,12 @@ def get_available_yolo_model():
     else:
         return None
 
+def get_available_car_type_model():
+    """Get the car type model path if it exists."""
+    if Paths.CAR_TYPE_MODEL_PATH.exists():
+        return Paths.CAR_TYPE_MODEL_PATH
+    return None
+
 def validate_model_paths():
     """Validate that required model files exist."""
     models_status = {
@@ -115,7 +128,8 @@ def validate_model_paths():
         'yolo_last': Paths.YOLO_LAST_MODEL.exists(),
         'crnn_primary': Paths.CRNN_MODEL_PATH.exists(),
         'crnn_alt': Paths.CRNN_MODEL_PATH_ALT.exists(),
-        'chars_file': Paths.CRNN_CHARS_FILE.exists()
+        'chars_file': Paths.CRNN_CHARS_FILE.exists(),
+        'car_type_model': Paths.CAR_TYPE_MODEL_PATH.exists()
     }
     
     return models_status
@@ -158,5 +172,11 @@ if __name__ == "__main__":
         print(f"🤖 Using CRNN model: {available_crnn.name}")
     else:
         print("⚠️  No CRNN model found!")
+    
+    available_car_type = get_available_car_type_model()
+    if available_car_type:
+        print(f"🚗 Using Car Type model: {available_car_type.name}")
+    else:
+        print("⚠️  No Car Type model found!")
     
     print("\nConfiguration loaded successfully!") 
