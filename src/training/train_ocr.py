@@ -26,6 +26,10 @@ import seaborn as sns
 from IPython.display import clear_output
 import threading
 from queue import Queue
+from multiprocessing import freeze_support
+# import argparse  # removed; not used
+# import optuna  # handled via optional import below
+# from training.train_ocr import train_crnn  # self import removed
 
 # Add beam search decoding
 try:
@@ -54,6 +58,7 @@ class Paths:
     MODEL_DIR = PROJECT_ROOT / "models" / "ocr"
     CRNN_V1_MODEL = MODEL_DIR / "crnn_v1" / "best_multiline_crnn_epoch292_acc0.9304.pth"
     CRNN_V2_DIR = MODEL_DIR / "crnn_v2"
+    CRNN_V3_DIR = MODEL_DIR / "crnn_v3"  # New directory for v3 model
     
     # Character set file
     CRNN_CHARS_FILE = DATA_PROCESSED / "all_chars.txt"
@@ -73,31 +78,50 @@ VAL_CSV_PATH = DATA_DIR / "val_data" / "labels.csv"
 TRAIN_IMG_DIR = DATA_DIR / "train_data"
 VAL_IMG_DIR = DATA_DIR / "val_data"
 
-# New model save location for stable training
-MODEL_SAVE_PATH = Paths.CRNN_V2_DIR
+# New model save location for v3
+MODEL_SAVE_PATH = Paths.CRNN_V3_DIR
 MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
 
-# Hyperparameters for STABLE training to achieve >95%
-# Adjusted for 6GB VRAM on RTX 3050
-BATCH_SIZE = 32
-LEARNING_RATE = 1e-3
-EPOCHS = 500
+# --- Tuned Hyperparameters for CRNN v3 ---
+# Goal: Improve generalization and reduce character confusion seen in v2.
+# Adjusted for 6GB VRAM on RTX 3050.
+BATCH_SIZE = 32          # Kept the same for memory stability
+LEARNING_RATE = 8e-4     # Reduced LR for better stability
+EPOCHS = 500             # Reduced epochs, early stopping should trigger anyway
 IMAGE_HEIGHT = 64
 IMAGE_WIDTH = 256
 HIDDEN_SIZE = 512
 
-# Regularization for stability
-DROPOUT_RATE = 0.4
-WEIGHT_DECAY = 5e-4
-LABEL_SMOOTHING = 0.1
+# --- Enhanced Regularization for CRNN v3 ---
+DROPOUT_RATE = 0.5       # Increased dropout for better generalization
+WEIGHT_DECAY = 1e-3      # Increased weight decay to combat overfitting
+LABEL_SMOOTHING = 0.15   # Increased label smoothing
 GRAD_CLIP = 0.5
 
+# === Pretraining control ===
+LOAD_PRETRAINED = False  # Train from scratch by default
+
+# === Visualizer & HPO flags ===
+ENABLE_VISUALIZER = True  # Set False for headless tuning runs
+USE_PROXY_DATA = False    # When True, train on a small random subset for HPO
+PROXY_FRACTION = 0.1      # 10 % of training samples when proxy mode is on
+
+# Check Optuna availability for pruning support
+try:
+    import optuna  # noqa: F401 – optional dependency
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+
+# Holder so training loop can access current Optuna Trial (set externally)
+optuna_trial = None
+
 # Loss weights
-ATTENTION_LOSS_WEIGHT = 0.5 # Weight for the attention decoder loss
+ATTENTION_LOSS_WEIGHT = 0.4 # Reduced attention weight to focus more on the new Focal CTC loss
 TEACHER_FORCING_RATIO = 0.6 # Probability of using teacher forcing
 
 # Early stopping for >95% target
-EARLY_STOPPING_PATIENCE = 360
+EARLY_STOPPING_PATIENCE = 140
 MIN_DELTA = 0.001
 TARGET_ACCURACY = 0.95
 
@@ -108,8 +132,18 @@ NUM_VERTICAL_ROWS = 3  # Keep 3 rows for multi-line support
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logger.info(f"Using device: {device}")
 
+# -----------------------------------------------------------
+#  Dummy visualizer – all methods are no-ops
+#  Used when ENABLE_VISUALIZER == False (e.g. Optuna runs)
+# -----------------------------------------------------------
+class DummyVisualizer:
+    def __getattr__(self, _):
+        def _noop(*args, **kwargs):
+            return None
+        return _noop
+
 class TrainingVisualizer:
-    def __init__(self, target_accuracy=0.95):
+    def __init__(self, target_accuracy=0.95, num_examples=6):
         self.target_accuracy = target_accuracy
         self.train_losses = []
         self.val_losses = []
@@ -119,10 +153,30 @@ class TrainingVisualizer:
         self.epochs = []
         self.batch_losses = []
         self.batch_numbers = []
+        self.num_examples = num_examples
         
-        # Create figure with subplots
-        self.fig, self.axes = plt.subplots(2, 3, figsize=(18, 12))
-        self.fig.suptitle('ANPR OCR Training Progress - Real Time', fontsize=16, fontweight='bold')
+        # Create figure with subplots for metrics and examples
+        self.fig = plt.figure(figsize=(20, 16))
+        self.fig.suptitle('ANPR OCR Training Progress - Real Time (CRNN v3)', fontsize=16, fontweight='bold')
+        
+        # Gridspec for layout - added a row for the title and gave more space to examples
+        gs = self.fig.add_gridspec(4, 6, height_ratios=[1, 1, 0.1, 1.2])
+        
+        # Main plot axes (spanning multiple columns)
+        self.axes = {
+            'loss': self.fig.add_subplot(gs[0, 0:2]),
+            'acc': self.fig.add_subplot(gs[0, 2:4]),
+            'char_acc': self.fig.add_subplot(gs[0, 4:6]),
+            'lr': self.fig.add_subplot(gs[1, 0:2]),
+            'batch_loss': self.fig.add_subplot(gs[1, 2:4]),
+            'stats': self.fig.add_subplot(gs[1, 4:6]),
+        }
+        
+        # Add a dedicated, invisible axis for the title text
+        self.title_ax = self.fig.add_subplot(gs[2, :])
+        
+        # Axes for recognition examples
+        self.example_axes = [self.fig.add_subplot(gs[3, i]) for i in range(self.num_examples)]
         
         # Configure subplots
         self.setup_plots()
@@ -137,44 +191,63 @@ class TrainingVisualizer:
     def setup_plots(self):
         """Setup all subplot configurations"""
         # Plot 1: Training & Validation Loss
-        self.axes[0, 0].set_title('Training & Validation Loss', fontweight='bold')
-        self.axes[0, 0].set_xlabel('Epoch')
-        self.axes[0, 0].set_ylabel('Loss')
-        self.axes[0, 0].grid(True, alpha=0.3)
+        self.axes['loss'].set_title('Training & Validation Loss', fontweight='bold')
+        self.axes['loss'].set_xlabel('Epoch')
+        self.axes['loss'].set_ylabel('Loss')
+        self.axes['loss'].grid(True, alpha=0.3)
         
         # Plot 2: Accuracy Progress
-        self.axes[0, 1].set_title('Validation Accuracy Progress', fontweight='bold')
-        self.axes[0, 1].set_xlabel('Epoch')
-        self.axes[0, 1].set_ylabel('Accuracy')
-        self.axes[0, 1].grid(True, alpha=0.3)
-        self.axes[0, 1].axhline(y=self.target_accuracy, color='red', linestyle='--', 
+        self.axes['acc'].set_title('Validation Accuracy Progress', fontweight='bold')
+        self.axes['acc'].set_xlabel('Epoch')
+        self.axes['acc'].set_ylabel('Accuracy')
+        self.axes['acc'].grid(True, alpha=0.3)
+        self.axes['acc'].axhline(y=self.target_accuracy, color='red', linestyle='--', 
                                label=f'Target ({self.target_accuracy*100:.0f}%)', linewidth=2)
-        self.axes[0, 1].legend()
+        self.axes['acc'].legend()
         
         # Plot 3: Character vs Exact Accuracy
-        self.axes[0, 2].set_title('Character vs Exact Match Accuracy', fontweight='bold')
-        self.axes[0, 2].set_xlabel('Epoch')
-        self.axes[0, 2].set_ylabel('Accuracy')
-        self.axes[0, 2].grid(True, alpha=0.3)
+        self.axes['char_acc'].set_title('Character vs Exact Match Accuracy', fontweight='bold')
+        self.axes['char_acc'].set_xlabel('Epoch')
+        self.axes['char_acc'].set_ylabel('Accuracy')
+        self.axes['char_acc'].grid(True, alpha=0.3)
         
         # Plot 4: Learning Rate Schedule
-        self.axes[1, 0].set_title('Learning Rate Schedule', fontweight='bold')
-        self.axes[1, 0].set_xlabel('Epoch')
-        self.axes[1, 0].set_ylabel('Learning Rate')
-        self.axes[1, 0].grid(True, alpha=0.3)
+        self.axes['lr'].set_title('Learning Rate Schedule', fontweight='bold')
+        self.axes['lr'].set_xlabel('Epoch')
+        self.axes['lr'].set_ylabel('Learning Rate')
+        self.axes['lr'].grid(True, alpha=0.3)
         
         # Plot 5: Batch Loss (Real-time)
-        self.axes[1, 1].set_title('Batch Loss (Real-time)', fontweight='bold')
-        self.axes[1, 1].set_xlabel('Batch Number')
-        self.axes[1, 1].set_ylabel('Loss')
-        self.axes[1, 1].grid(True, alpha=0.3)
+        self.axes['batch_loss'].set_title('Batch Loss (Real-time)', fontweight='bold')
+        self.axes['batch_loss'].set_xlabel('Batch Number')
+        self.axes['batch_loss'].set_ylabel('Loss')
+        self.axes['batch_loss'].grid(True, alpha=0.3)
         
         # Plot 6: Training Statistics
-        self.axes[1, 2].set_title('Training Statistics', fontweight='bold')
-        self.axes[1, 2].axis('off')
+        self.axes['stats'].set_title('Training Statistics', fontweight='bold')
+        self.axes['stats'].axis('off')
         
-        plt.tight_layout()
+        # Plot 7: Live Recognition Examples title in its own dedicated axis
+        self.title_ax.clear()
+        self.title_ax.axis('off')
+        self.title_ax.text(0.5, 0.5, 'Live Recognition Examples', ha='center', va='center', fontsize=14, fontweight='bold')
         
+        for ax in self.example_axes:
+            ax.axis('off')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.97]) # Use simpler, more robust layout adjustment
+            
+    def is_minimized(self):
+        """Check if the matplotlib window is minimized to prevent blocking."""
+        try:
+            # This works for the TkAgg backend used in the script.
+            # It checks if the window state is 'iconic' (minimized).
+            return self.fig.canvas.manager.window.state() == 'iconic'
+        except Exception:
+            # Fallback for other backends or if window is destroyed.
+            # If we can't determine state, assume it's not minimized to be safe.
+            return False
+            
     def update_batch_loss(self, batch_num, loss):
         """Update batch loss in real-time"""
         self.batch_numbers.append(batch_num)
@@ -196,61 +269,61 @@ class TrainingVisualizer:
         
     def update_plots(self):
         """Update all plots with current data"""
+        if self.is_minimized():
+            # Skip rendering if the window is minimized to avoid blocking and save resources
+            return
+            
         try:
-            # Clear all axes
-            for ax in self.axes.flat:
+            # Clear all main axes
+            for key, ax in self.axes.items():
                 ax.clear()
             
             self.setup_plots()
             
             if len(self.epochs) > 0:
                 # Plot 1: Training & Validation Loss
-                self.axes[0, 0].plot(self.epochs, self.train_losses, 'b-', label='Training Loss', linewidth=2)
-                self.axes[0, 0].plot(self.epochs, self.val_losses, 'r-', label='Validation Loss', linewidth=2)
-                self.axes[0, 0].legend()
-                self.axes[0, 0].set_title('Training & Validation Loss', fontweight='bold')
+                self.axes['loss'].plot(self.epochs, self.train_losses, 'b-', label='Training Loss', linewidth=2)
+                self.axes['loss'].plot(self.epochs, self.val_losses, 'r-', label='Validation Loss', linewidth=2)
+                self.axes['loss'].legend()
                 
                 # Plot 2: Accuracy Progress
-                self.axes[0, 1].plot(self.epochs, [acc*100 for acc in self.val_accuracies], 
+                self.axes['acc'].plot(self.epochs, [acc*100 for acc in self.val_accuracies], 
                                    'g-', label='Validation Accuracy', linewidth=3)
-                self.axes[0, 1].axhline(y=self.target_accuracy*100, color='red', linestyle='--', 
+                self.axes['acc'].axhline(y=self.target_accuracy*100, color='red', linestyle='--', 
                                       label=f'Target ({self.target_accuracy*100:.0f}%)', linewidth=2)
-                self.axes[0, 1].set_ylim(0, 100)
-                self.axes[0, 1].legend()
-                self.axes[0, 1].set_title('Validation Accuracy Progress', fontweight='bold')
+                self.axes['acc'].set_ylim(0, 100)
+                self.axes['acc'].legend()
                 
                 # Add progress indicator
                 if self.val_accuracies:
                     current_acc = self.val_accuracies[-1] * 100
                     if current_acc >= self.target_accuracy * 100:
-                        self.axes[0, 1].text(0.5, 0.95, '🎯 TARGET ACHIEVED!', 
-                                           transform=self.axes[0, 1].transAxes, 
+                        self.axes['acc'].text(0.5, 0.95, '🎯 TARGET ACHIEVED!', 
+                                           transform=self.axes['acc'].transAxes, 
                                            ha='center', va='top', fontsize=12, 
                                            bbox=dict(boxstyle="round,pad=0.3", facecolor="green", alpha=0.7))
                     else:
                         gap = self.target_accuracy * 100 - current_acc
-                        self.axes[0, 1].text(0.5, 0.95, f'Gap to target: {gap:.1f}%', 
-                                           transform=self.axes[0, 1].transAxes, 
+                        self.axes['acc'].text(0.5, 0.95, f'Gap to target: {gap:.1f}%', 
+                                           transform=self.axes['acc'].transAxes, 
                                            ha='center', va='top', fontsize=10, 
                                            bbox=dict(boxstyle="round,pad=0.3", facecolor="orange", alpha=0.7))
                 
                 # Plot 3: Character vs Exact Accuracy
-                self.axes[0, 2].plot(self.epochs, [acc*100 for acc in self.val_accuracies], 
+                self.axes['char_acc'].plot(self.epochs, [acc*100 for acc in self.val_accuracies], 
                                    'g-', label='Exact Match', linewidth=2)
-                self.axes[0, 2].plot(self.epochs, [acc*100 for acc in self.char_accuracies], 
+                self.axes['char_acc'].plot(self.epochs, [acc*100 for acc in self.char_accuracies], 
                                    'b-', label='Character Level', linewidth=2)
-                self.axes[0, 2].set_ylim(0, 100)
-                self.axes[0, 2].legend()
-                self.axes[0, 2].set_title('Character vs Exact Match Accuracy', fontweight='bold')
+                self.axes['char_acc'].set_ylim(0, 100)
+                self.axes['char_acc'].legend()
                 
                 # Plot 4: Learning Rate Schedule
-                self.axes[1, 0].plot(self.epochs, self.learning_rates, 'purple', linewidth=2)
-                self.axes[1, 0].set_yscale('log')
-                self.axes[1, 0].set_title('Learning Rate Schedule', fontweight='bold')
+                self.axes['lr'].plot(self.epochs, self.learning_rates, 'purple', linewidth=2)
+                self.axes['lr'].set_yscale('log')
                 
             # Plot 5: Batch Loss (Real-time)
             if len(self.batch_losses) > 0:
-                self.axes[1, 1].plot(self.batch_numbers, self.batch_losses, 'orange', alpha=0.7, linewidth=1)
+                self.axes['batch_loss'].plot(self.batch_numbers, self.batch_losses, 'orange', alpha=0.7, linewidth=1)
                 if len(self.batch_losses) > 10:
                     # Add moving average
                     window = min(50, len(self.batch_losses) // 4)
@@ -258,12 +331,11 @@ class TrainingVisualizer:
                     for i in range(len(self.batch_losses)):
                         start_idx = max(0, i - window + 1)
                         moving_avg.append(np.mean(self.batch_losses[start_idx:i+1]))
-                    self.axes[1, 1].plot(self.batch_numbers, moving_avg, 'red', linewidth=2, label=f'Moving Avg ({window})')
-                    self.axes[1, 1].legend()
-                self.axes[1, 1].set_title('Batch Loss (Real-time)', fontweight='bold')
+                    self.axes['batch_loss'].plot(self.batch_numbers, moving_avg, 'red', linewidth=2, label=f'Moving Avg ({window})')
+                    self.axes['batch_loss'].legend()
             
             # Plot 6: Training Statistics
-            self.axes[1, 2].axis('off')
+            self.axes['stats'].axis('off')
             stats_text = "Training Statistics\n" + "="*25 + "\n"
             
             if len(self.epochs) > 0:
@@ -300,18 +372,63 @@ class TrainingVisualizer:
             else:
                 stats_text += "Waiting for training data..."
             
-            self.axes[1, 2].text(0.05, 0.95, stats_text, transform=self.axes[1, 2].transAxes, 
+            self.axes['stats'].text(0.05, 0.95, stats_text, transform=self.axes['stats'].transAxes, 
                                va='top', ha='left', fontsize=11, 
                                bbox=dict(boxstyle="round,pad=0.5", facecolor="lightblue", alpha=0.8))
             
-            plt.tight_layout()
+            plt.tight_layout(rect=[0, 0.03, 1, 0.97]) # Use simpler, more robust layout adjustment
             self.fig.canvas.draw()
             self.fig.canvas.flush_events()
             plt.pause(0.001)  # allow GUI event loop to process
             
         except Exception as e:
             logger.warning(f"Error updating plots: {e}")
-            
+
+    def update_recognition_examples(self, model, dataloader, char_list, device):
+        """Update the recognition examples plot with live predictions."""
+        model.eval()
+        
+        images, true_texts, pred_texts, confs = [], [], [], []
+        
+        # Ensure we get a consistent set of examples
+        if not hasattr(self, 'fixed_examples'):
+            self.fixed_examples = []
+            for batch in dataloader:
+                if len(self.fixed_examples) >= self.num_examples:
+                    break
+                self.fixed_examples.append(batch)
+        
+        with torch.no_grad():
+            for batch in self.fixed_examples:
+                imgs_batch, targets_batch, target_lengths_batch = batch
+                imgs_batch = imgs_batch.to(device)
+                
+                outputs, _ = model(imgs_batch)
+                decoded_texts, confidences = decode_ctc_predictions(outputs, char_list)
+                
+                for i in range(len(decoded_texts)):
+                    if len(images) < self.num_examples:
+                        img_tensor = imgs_batch[i].cpu()
+                        img_tensor = img_tensor * 0.5 + 0.5
+                        images.append(img_tensor.permute(1, 2, 0).numpy())
+                        
+                        target_indices = targets_batch[i][:target_lengths_batch[i]].cpu().tolist()
+                        true_text = "".join([char_list[idx] for idx in target_indices if idx != 0])
+                        true_texts.append(true_text)
+                        pred_texts.append(decoded_texts[i])
+                        confs.append(confidences[i])
+
+        for i in range(self.num_examples):
+            ax = self.example_axes[i]
+            ax.clear()
+            ax.axis('off')
+            if i < len(images):
+                ax.imshow(images[i], cmap='gray')
+                is_correct = (true_texts[i] == pred_texts[i])
+                color = 'green' if is_correct else 'red'
+                title = f"True: {true_texts[i]}\nPred: {pred_texts[i]} ({confs[i]:.2f})"
+                ax.set_title(title, color=color, fontsize=10, pad=3)
+
     def save_plots(self, save_path):
         """Save the current plots"""
         try:
@@ -577,6 +694,46 @@ class CustomCRNN(nn.Module):
         output = self.rnn2(output)
         return output
 
+class FocalCTCLoss(nn.Module):
+    """
+    Focal CTC Loss implementation.
+    Reduces loss for well-classified examples, focusing on hard-to-classify ones.
+    This makes training more challenging and encourages better generalization.
+    """
+    def __init__(self, blank_index, alpha=1.0, gamma=1.0, reduction='mean'):
+        super(FocalCTCLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        # Use 'none' reduction to get per-example losses
+        self.ctc_loss = nn.CTCLoss(blank=blank_index, reduction='none', zero_infinity=True)
+        self.reduction = reduction
+
+    def forward(self, log_probs, targets, input_lengths, target_lengths):
+        """
+        log_probs: Log-probabilities of predictions (T, N, C)
+        targets: Ground truth labels (N, S) or (sum(target_lengths))
+        input_lengths: Lengths of predictions (N)
+        target_lengths: Lengths of ground truth labels (N)
+        """
+        # Calculate standard CTC loss for each item in the batch
+        per_example_loss = self.ctc_loss(log_probs, targets, input_lengths, target_lengths)
+        
+        # The probability of the correct sequence is p = exp(-ctc_loss)
+        p = torch.exp(-per_example_loss)
+        
+        # Calculate the Focal component: alpha * (1-p)^gamma
+        focal_term = self.alpha * torch.pow(1 - p, self.gamma)
+        
+        # Modulate the CTC loss by the Focal component
+        focal_ctc_loss = focal_term * per_example_loss
+        
+        if self.reduction == 'mean':
+            return focal_ctc_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_ctc_loss.sum()
+        else:
+            return focal_ctc_loss
+
 def custom_collate_fn(batch):
     images, targets, lengths = zip(*batch)
     images = torch.stack(images, 0)
@@ -636,7 +793,7 @@ def train_epoch_step(model, images, targets, target_lengths, ctc_criterion, atte
             # 3. Combined Loss
             combined_loss = (1 - ATTENTION_LOSS_WEIGHT) * ctc_loss_val + ATTENTION_LOSS_WEIGHT * attention_loss_val
         
-        if torch.isnan(combined_loss) or torch.isinf(combined_loss) or combined_loss.item() > 50:
+        if torch.isnan(combined_loss) or torch.isinf(combined_loss) or combined_loss.item() > 100:
             logger.warning(f"Skipping batch due to unstable loss: {combined_loss.item()}")
             return None, None, None
         
@@ -663,7 +820,7 @@ def train_epoch_step(model, images, targets, target_lengths, ctc_criterion, atte
         # 3. Combined Loss
         combined_loss = (1 - ATTENTION_LOSS_WEIGHT) * ctc_loss_val + ATTENTION_LOSS_WEIGHT * attention_loss_val
 
-        if torch.isnan(combined_loss) or torch.isinf(combined_loss) or combined_loss.item() > 50:
+        if torch.isnan(combined_loss) or torch.isinf(combined_loss) or combined_loss.item() > 100:
             logger.warning(f"Skipping batch due to unstable loss: {combined_loss.item()}")
             return None, None, None
 
@@ -788,9 +945,12 @@ def validate_model(model, dataloader, ctc_criterion, char_list, epoch_num):
 def main():
     logger.info("=== Enhanced Custom CRNN Model Training for ANPR_3 v3 ===")
     
-    # Initialize training visualizer
-    visualizer = TrainingVisualizer(target_accuracy=TARGET_ACCURACY)
-    logger.info("🎨 Training visualizer initialized - Real-time plots will be displayed")
+    # Initialize training visualizer (or dummy if disabled)
+    visualizer = TrainingVisualizer(target_accuracy=TARGET_ACCURACY) if ENABLE_VISUALIZER else DummyVisualizer()
+    if ENABLE_VISUALIZER:
+        logger.info("🎨 Training visualizer initialized - Real-time plots will be displayed")
+    else:
+        logger.info("Visualizer disabled – running in headless mode.")
     
     char_list = get_character_set_from_file(ALL_CHARS_FILE_PATH)
     n_classes = len(char_list)
@@ -799,14 +959,19 @@ def main():
         logger.error("Character set is too small or empty. Exiting.")
         return
 
+    # --- Enhanced Data Augmentation for CRNN v3 ---
+    # Goal: Simulate real-world conditions like lighting changes, motion blur, and perspective shifts.
     train_transform = transforms.Compose([
         transforms.Resize((IMAGE_HEIGHT, IMAGE_WIDTH)),
-        transforms.RandomAffine(degrees=5, translate=(0.1, 0.1), scale=(0.8, 1.2), shear=5),
-        transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
-        transforms.GaussianBlur(kernel_size=(3,3), sigma=(0.1, 1.5)),
+        transforms.RandomChoice([
+            transforms.RandomAffine(degrees=7, translate=(0.1, 0.1), scale=(0.8, 1.2), shear=8, fill=128),
+            transforms.RandomPerspective(distortion_scale=0.4, p=0.9, fill=128),
+        ]),
+        transforms.ColorJitter(brightness=0.6, contrast=0.6, saturation=0.4, hue=0.2),
+        transforms.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.5)),
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,)),
-        transforms.RandomErasing(p=0.2, scale=(0.02, 0.1), ratio=(0.3, 3.3), value=0)
+        transforms.RandomErasing(p=0.4, scale=(0.02, 0.15), ratio=(0.3, 3.3), value=0)
     ])
     
     val_transform = transforms.Compose([
@@ -818,6 +983,15 @@ def main():
     train_dataset = CustomOCRDataset(TRAIN_CSV_PATH, TRAIN_IMG_DIR, char_list, train_transform, is_training=True)
     val_dataset = CustomOCRDataset(VAL_CSV_PATH, VAL_IMG_DIR, char_list, val_transform, is_training=False)
     
+    # ------------------------------------------------------------------
+    # Optional: Use a smaller proxy subset for quick hyper-parameter tuning
+    # ------------------------------------------------------------------
+    if USE_PROXY_DATA and len(train_dataset) > 0:
+        proxy_size = max(1, int(PROXY_FRACTION * len(train_dataset)))
+        proxy_indices = np.random.choice(len(train_dataset), proxy_size, replace=False)
+        train_dataset = Subset(train_dataset, proxy_indices)
+        logger.info(f"Proxy mode ON – using {len(train_dataset)}/{int(1/PROXY_FRACTION)} of training data ({PROXY_FRACTION*100:.1f}%).")
+
     if len(train_dataset) == 0:
         logger.error("Training dataset is empty. Please check data paths and CSV files.")
         return
@@ -844,9 +1018,9 @@ def main():
         sampler=sampler,
         shuffle=False if sampler is not None else True, 
         collate_fn=custom_collate_fn, 
-        num_workers=4,  # Adjusted for robust performance on Windows
+        num_workers=0,  # Set to 0 to prevent multiprocessing issues on Windows
         pin_memory=True, 
-        persistent_workers=True if device.type == 'cuda' else False,
+        persistent_workers=False, # Not needed when num_workers is 0
         drop_last=True  # For more stable training
     )
     val_loader = DataLoader(
@@ -854,9 +1028,9 @@ def main():
         batch_size=BATCH_SIZE, 
         shuffle=False, 
         collate_fn=custom_collate_fn, 
-        num_workers=4, 
+        num_workers=0, # Set to 0 to prevent multiprocessing issues on Windows
         pin_memory=True, 
-        persistent_workers=True if device.type == 'cuda' else False
+        persistent_workers=False # Not needed when num_workers is 0
     )
     
     # ------------------------------------------------------------------
@@ -928,7 +1102,10 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Model Parameters: Total={total_params:,}, Trainable={trainable_params:,}")
 
-    # Enhanced loss functions
+    # --- Loss function ---
+    # Using standard CTCLoss for better numerical stability.
+    # FocalCTCLoss can be re-introduced later if needed for hard-example mining.
+    logger.info("Using standard nn.CTCLoss for stability.")
     ctc_criterion = nn.CTCLoss(blank=char_list.index('[blank]'), reduction='mean', zero_infinity=True).to(device)
     char_criterion = nn.CrossEntropyLoss(ignore_index=char_list.index('[blank]'), label_smoothing=LABEL_SMOOTHING).to(device)
 
@@ -943,29 +1120,33 @@ def main():
     
     # OneCycleLR scheduler
     scheduler = OneCycleLR(optimizer, max_lr=LEARNING_RATE, total_steps=EPOCHS * len(train_loader),
-                           pct_start=0.1, anneal_strategy='cos', div_factor=25, final_div_factor=100)
+                           pct_start=0.15, anneal_strategy='cos', div_factor=20, final_div_factor=1000)
 
     # Load pretrained model if it exists
-    pretrained_model_path = Paths.CRNN_V1_MODEL
-    if os.path.exists(pretrained_model_path):
-        logger.info(f"Loading pretrained model from {pretrained_model_path}")
-        try:
-            checkpoint = torch.load(pretrained_model_path, map_location=device)
-            
-            # Filter out mismatched keys (e.g., final layer if n_classes changed)
-            model_dict = model.state_dict()
-            pretrained_dict = {k: v for k, v in checkpoint['model_state_dict'].items() 
-                               if k in model_dict and model_dict[k].shape == v.shape}
-            
-            model_dict.update(pretrained_dict)
-            model.load_state_dict(model_dict, strict=False) # Use strict=False to ignore non-matching keys
-            logger.info(f"Successfully loaded {len(pretrained_dict)}/{len(model_dict)} keys from pretrained model.")
+    if LOAD_PRETRAINED:
+        pretrained_model_path = Paths.CRNN_V2_DIR / "best_multiline_crnn_epoch51_acc0.9966.pth"
+        if os.path.exists(pretrained_model_path):
+            logger.info(f"Loading pretrained weights from best v2 model: {pretrained_model_path}")
+            try:
+                checkpoint = torch.load(pretrained_model_path, map_location=device)
+                
+                # Filter out mismatched keys (e.g., final layer if n_classes changed)
+                model_dict = model.state_dict()
+                pretrained_dict = {k: v for k, v in checkpoint['model_state_dict'].items() 
+                                   if k in model_dict and model_dict[k].shape == v.shape}
+                
+                model_dict.update(pretrained_dict)
+                model.load_state_dict(model_dict, strict=False) # Use strict=False to ignore non-matching keys
+                logger.info(f"Successfully loaded {len(pretrained_dict)}/{len(model_dict)} keys from pretrained model.")
 
-        except Exception as e:
-            logger.error(f"Could not load pretrained model: {e}. Starting from scratch.")
+            except Exception as e:
+                logger.error(f"Could not load pretrained model: {e}. Starting from scratch.")
+                model.apply(init_weights)
+        else:
+            logger.info("Pretrained flag is True but no v2 model found. Initializing weights from scratch.")
             model.apply(init_weights)
     else:
-        logger.info("No pretrained model found. Initializing weights from scratch.")
+        logger.info("Training from scratch: NOT loading any pretrained weights.")
         model.apply(init_weights)
 
     # Enable Mixed Precision Training (AMP) for better performance on RTX GPUs
@@ -1057,7 +1238,20 @@ def main():
 
         val_accuracies.append(val_accuracy)
         char_accuracies.append(val_char_accuracy)
-        
+
+        # ---------------- Optuna pruning ----------------
+        if OPTUNA_AVAILABLE and globals().get('optuna_trial', None) is not None:
+            trial = globals()['optuna_trial']
+            try:
+                trial.report(val_accuracy, epoch)
+                if trial.should_prune():
+                    import optuna
+                    logger.info("Optuna decided to prune at epoch %d" % epoch)
+                    raise optuna.exceptions.TrialPruned()
+            except Exception as _e:
+                # If pruning exception bubbles up, higher-level caller should catch
+                raise
+
         avg_ctc_loss_epoch = running_ctc_loss / batches_processed if batches_processed > 0 else 0
         avg_attn_loss_epoch = running_char_loss / batches_processed if batches_processed > 0 else 0
 
@@ -1073,6 +1267,11 @@ def main():
         # Update visualizer with epoch data
         current_lr = optimizer.param_groups[0]['lr']
         visualizer.update_epoch_data(epoch, avg_epoch_train_loss, val_loss, val_accuracy, val_char_accuracy, current_lr)
+        
+        # Update recognition examples plot before drawing all updates
+        visualizer.update_recognition_examples(model, state_val_loader, char_list, device)
+        
+        # Now, draw all updates to the plots
         visualizer.update_plots()
         
         epoch_duration = time.time() - epoch_start_time
@@ -1289,7 +1488,62 @@ def main():
     visualizer.close()
     logger.info("Training visualization closed.")
 
+    # Return best validation accuracy so external HPO scripts can use it
+    return best_val_accuracy
+
+# -----------------------------------------------------------
+#  External API for hyper-parameter optimisation               
+# -----------------------------------------------------------
+
+def apply_hyperparameters(hparams: dict):
+    """Inject values from *hparams* into this module's globals."""
+    global ENABLE_VISUALIZER, USE_PROXY_DATA, PROXY_FRACTION, LOAD_PRETRAINED
+    for key, value in hparams.items():
+        if key in globals():
+            globals()[key] = value
+
+
+def train_crnn(hparams: dict | None = None, trial: "optuna.trial.Trial | None" = None):
+    """Convenience wrapper so external scripts (Optuna, Ray-Tune, etc.)
+    can start a training run with an arbitrary hyper-parameter dict.
+
+    Parameters
+    ----------
+    hparams : dict
+        Keys matching any global in this module will overwrite that global
+        before training starts.  Example::
+
+            hparams = {"HIDDEN_SIZE": 384, "LEARNING_RATE": 1e-3}
+    trial : optuna.trial.Trial, optional
+        When supplied, the training loop will report validation accuracy
+        each epoch and will honour trial pruning requests.
+
+    Returns
+    -------
+    float
+        Best validation accuracy achieved during the run (higher is better).
+    """
+    if hparams is None:
+        hparams = {}
+
+    if trial is not None:
+        globals()["optuna_trial"] = trial
+        # Disable visualiser for HPO – saves a lot of overhead
+        hparams.setdefault("ENABLE_VISUALIZER", False)
+        # Proxy mode is extremely useful for fast HPO
+        hparams.setdefault("USE_PROXY_DATA", True)
+
+    apply_hyperparameters(hparams)
+
+    best_acc = main()
+
+    # Clean-up so subsequent calls start with a blank slate
+    globals()["optuna_trial"] = None
+    return best_acc
+
+
 if __name__ == '__main__':
+    freeze_support()
     try:
         main()
     except KeyboardInterrupt:
@@ -1299,3 +1553,18 @@ if __name__ == '__main__':
         logger.error(f"Training failed: {e}")
         plt.close('all')  # Close all matplotlib windows
         raise 
+
+def objective(trial):
+    hp = {
+        "HIDDEN_SIZE": trial.suggest_categorical("hidden", [256,384,512]),
+        "DROPOUT_RATE": trial.suggest_float("drop", 0.2, 0.6),
+        "LEARNING_RATE": trial.suggest_float("lr", 5e-4, 3e-3, log=True),
+        "USE_PROXY_DATA": True,      # 10 % subset
+        "ENABLE_VISUALIZER": False,  # head-less
+        "EPOCHS": 80                 # short runs
+    }
+    return train_crnn(hp, trial)
+
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=30)
+print(study.best_params, study.best_value)
