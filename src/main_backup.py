@@ -1754,7 +1754,7 @@ class VideoThread(QThread):
                 )
                 if cap is None:
                     logger.error(f"Failed to configure camera {self.camera_index}")
-                    cap = cv2.VideoCapture(self.camera_index)  # Fallback to basic camera
+                    cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)  # Fallback to basic camera
             else:
                 cap = cv2.VideoCapture(self.source_path)
             
@@ -3356,7 +3356,7 @@ def detect_available_cameras(max_cameras=10):
     
     for i in range(max_cameras):
         try:
-            cap = cv2.VideoCapture(i)
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
             if cap.isOpened():
                 # Try to read a frame to verify camera works
                 ret, _ = cap.read()
@@ -3386,7 +3386,7 @@ def detect_available_cameras(max_cameras=10):
 def configure_camera(camera_index, width=None, height=None, fps=None):
     """Configure camera with specified settings"""
     try:
-        cap = cv2.VideoCapture(camera_index)
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
         if not cap.isOpened():
             return None
         
