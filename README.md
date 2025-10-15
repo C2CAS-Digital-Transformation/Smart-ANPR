@@ -68,89 +68,38 @@ ANPR/
 ### Prerequisites
 
 - Python 3.8 or higher
-- CUDA-capable GPU (recommended for training)
-- Webcam or video files for testing
+- Git
+- Webcam or video files for testing (optional)
+- CUDA-capable GPU (optional, for better performance)
 
-### Option 1: Quick Setup (Production Deployment)
+### Quick Setup
 
 ```bash
-# Clone the repository
+# 1. Clone the repository
 git clone <repository-url>
 cd ANPR
 
-# Install dependencies
+# 2. Create virtual environment
+python -m venv anpr
+
+# 3. Activate virtual environment
+# On Windows:
+anpr\Scripts\activate
+# On Linux/Mac:
+source anpr/bin/activate
+
+# 4. Install dependencies
 pip install -r requirements.txt
 
-# Verify models are in place
-ls models/application_runner/
-# Should show: best.pt and best_crnn_model_epoch125_acc0.9010.pth
-
-# Run the application
+# 5. Run the application
 python src/main.py
 ```
 
-**Note:** The production models in `models/application_runner/` are included in the repository (~10MB total). 
-No additional downloads needed!
-
-### Option 2: Development Setup
-
-```bash
-# Clone the repository
-git clone <repository-url>
-cd ANPR
-
-# Install in development mode
-pip install -e .
-
-# Install development dependencies
-pip install -e .[dev]
-
-# Install fast CTC decoding (optional, for better OCR performance)
-pip install -e .[fast]
-```
+**That's it!** The production models are included in the repository (~10MB). No additional downloads needed!
 
 ## 🚦 Quick Start
 
-### 1. Model Setup
-
-The system uses pre-trained models optimized for ANPR, located in `models/application_runner/`:
-
-**Production Models (Application Runner):**
-
-- **Detection Model:** `models/application_runner/best.pt`
-  - Type: YOLO11n ANPR
-  - Size: Lightweight (~6MB)
-  - Performance: 90.3% mAP@0.5
-  
-- **OCR Model:** `models/application_runner/best_crnn_model_epoch125_acc0.9010.pth`
-  - Type: CRNN v7
-  - Accuracy: 90.10%
-  - Character set: 36 characters (0-9, A-Z, [blank])
-
-**Path Configuration:**
-The system uses **relative paths** that work on any system after cloning:
-```python
-# Automatically resolves to project root
-PROJECT_ROOT / "models" / "application_runner" / "best.pt"
-PROJECT_ROOT / "models" / "application_runner" / "best_crnn_model_epoch125_acc0.9010.pth"
-```
-
-No manual path configuration needed! Just clone and run.
-
-### 2. Run the Application
-
-```bash
-# Method 1: Direct execution
-python src/main.py
-
-# Method 2: Using setup.py entry point (after installation)
-anpr
-
-# Method 3: Module execution
-python -m src.main
-```
-
-### 3. Using the GUI
+### Using the GUI
 
 1. **Select Input Source**: Choose between camera or video file
 2. **Configure Settings**: Adjust confidence thresholds and detection parameters

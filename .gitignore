@@ -28,6 +28,12 @@ __pycache__/
 *.pyw
 *.pyz
 
+# Virtual environments
+anpr/
+venv/
+env/
+.venv/
+
 # Trash and IDE folders
 Trash/
 .vscode/
