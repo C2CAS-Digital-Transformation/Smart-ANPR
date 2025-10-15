@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 class Config:
     # Model paths (using user provided paths)
     YOLO_MODEL_PATH = r"D:\Work\Projects\ANPR\models\detection\yolo11n_anpr\weights\best.pt"
-    CRNN_MODEL_PATH = r"D:\Work\Projects\ANPR\models\ocr\crnn_v1\best_multiline_crnn_epoch292_acc0.9304.pth"
+    CRNN_MODEL_PATH = r"D:\Work\Projects\ANPR\models\ocr\crnn_v7\best_crnn_model_epoch125_acc0.9010.pth"
     # CRNN_MODEL_PATH = r"D:\Work\Projects\ANPR\models\ocr\crnn_v2\best_multiline_crnn_epoch51_acc0.9966.pth"
     CRNN_MODEL_PATH_ALT = r"D:\Work\Projects\ANPR_3\saved_models\stable_crnn_v6\checkpoint_epoch_310_acc0.923.pth"
     
@@ -89,7 +89,7 @@ class Config:
     # OCR parameters  
     OCR_IMG_HEIGHT = 64
     OCR_IMG_WIDTH = 256
-    MIN_OCR_CONFIDENCE = 0.3  # Lowered from 0.5 to 0.3 for debugging
+    MIN_OCR_CONFIDENCE = 0.1  # Temporarily lowered from 0.3 for debugging
     
     # Duplicate prevention
     DUPLICATE_TIME_WINDOW = 5.0  # seconds
@@ -98,6 +98,7 @@ class Config:
     # Output
     OUTPUT_DIR = Path(r"D:\Work\Projects\ANPR\outputs")
     SAVE_DETECTIONS = True # Default to saving detections
+    NUM_VERTICAL_ROWS = 3 # For multi-line CRNN model
 
 @dataclass
 class Detection:
@@ -132,42 +133,47 @@ class ImprovedBidirectionalLSTM(nn.Module):
         return output
 
 class CustomCRNN(nn.Module):
-    """Custom CRNN model for license plate recognition"""
-    def __init__(self, img_height, n_classes, n_hidden=256, dropout_rate=0.3, input_channels=3):
+    """Custom CRNN model for license plate recognition (matching train_custom_crnn.py exactly)"""
+    def __init__(self, img_height, n_classes, n_hidden=256):
         super(CustomCRNN, self).__init__()
-        self.input_channels = input_channels
+        
+        # CNN part exactly as in training script
         self.cnn = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(32), nn.ReLU(True), nn.Dropout2d(dropout_rate * 0.5),
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(32), nn.ReLU(True), nn.Dropout2d(0.3 * 0.5),
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(64), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
+            nn.MaxPool2d(2, 2), # 64x32x128
 
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(128), nn.ReLU(True), nn.Dropout2d(dropout_rate * 0.5),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(128), nn.ReLU(True), nn.Dropout2d(0.3 * 0.5),
             nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(128), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
+            nn.MaxPool2d(2, 2), # 128x16x64
 
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(256), nn.ReLU(True), nn.Dropout2d(dropout_rate * 0.7),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(256), nn.ReLU(True), nn.Dropout2d(0.3 * 0.7),
             nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(256), nn.ReLU(True),
-            nn.MaxPool2d((2, 1), (2, 1)),
+            nn.MaxPool2d((2, 1), (2, 1)), # 256x8x64
 
             nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(512), nn.ReLU(True),
-            nn.MaxPool2d((2, 1), (2, 1)),
+            nn.MaxPool2d((2, 1), (2, 1)), # 512x4x64
             
-            nn.Conv2d(512, 512, kernel_size=2, stride=1, padding=0), nn.BatchNorm2d(512), nn.ReLU(True), nn.Dropout2d(dropout_rate)
+            nn.Conv2d(512, 512, kernel_size=2, stride=1, padding=0), nn.BatchNorm2d(512), nn.ReLU(True), nn.Dropout2d(0.3) # 512x3x63
         )
         
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, None))
+        # RNN part exactly as in training script
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, None)) # Output H will be 1
+        
+        # Calculate RNN input size based on CNN output - exactly as in training script
         self.rnn_input_size = 512 
-        self.rnn1 = ImprovedBidirectionalLSTM(self.rnn_input_size, n_hidden // 2, n_hidden // 2, num_layers=2, dropout=dropout_rate)
-        self.rnn2 = ImprovedBidirectionalLSTM(n_hidden // 2, n_hidden // 2, n_classes, num_layers=1, dropout=dropout_rate)
+        self.rnn1 = ImprovedBidirectionalLSTM(self.rnn_input_size, n_hidden // 2, n_hidden // 2, num_layers=2, dropout=0.3)
+        self.rnn2 = ImprovedBidirectionalLSTM(n_hidden // 2, n_hidden // 2, n_classes, num_layers=1, dropout=0.3)
         
     def forward(self, input_tensor):
+        # Forward logic exactly as in training script
         conv = self.cnn(input_tensor)
         conv = self.adaptive_pool(conv)
-        conv = conv.squeeze(2)
-        conv = conv.permute(2, 0, 1)
+        conv = conv.squeeze(2) # Remove height dimension (H=1): (batch, channels, width)
+        conv = conv.permute(2, 0, 1) # (width, batch, channels) for RNN
         
         output = self.rnn1(conv)
-        output = self.rnn2(output)
+        output = self.rnn2(output) # Output shape: (seq_len, batch, num_classes)
         return output
 
 class ANPRProcessor:
@@ -183,6 +189,10 @@ class ANPRProcessor:
         self.char_list = None
         self.yolo_loaded = False
         self.crnn_loaded = False
+        
+        # Class indices for YOLO model - will be loaded dynamically
+        self.plate_class_idx = -1
+        self.vehicle_class_indices = []
         
         # Detection tracking
         self.recent_detections = deque(maxlen=100)
@@ -241,6 +251,21 @@ class ANPRProcessor:
                 self.yolo_model.to('cpu')
                 logger.info("YOLO model loaded successfully (CPU mode)")
                 self.yolo_loaded = True
+
+                # Dynamically determine class indices from the model
+                if hasattr(self.yolo_model, 'names'):
+                    class_names = self.yolo_model.names
+                    self.vehicle_class_indices = [k for k, v in class_names.items() if v.lower() in ['car', 'motorcycle', 'vehicle']]
+                    plate_indices = [k for k, v in class_names.items() if 'plate' in v.lower()]
+                    if plate_indices:
+                        self.plate_class_idx = plate_indices[0]
+                    
+                    logger.info(f"Dynamically loaded YOLO class indices -> Vehicles: {self.vehicle_class_indices}, Plate: {self.plate_class_idx}")
+                else:
+                    # Fallback to hardcoded indices if names attribute is not available
+                    logger.warning("Could not read class names from YOLO model. Using hardcoded indices.")
+                    self.vehicle_class_indices = [0, 1]
+                    self.plate_class_idx = 2
             else:
                 logger.warning("YOLO model not available")
                 self.yolo_loaded = False
@@ -283,22 +308,31 @@ class ANPRProcessor:
             n_classes = model_config.get('n_classes', len(self.char_list))
             n_hidden = model_config.get('n_hidden', 256)
             
-            # Detect input channels from model state dict
-            first_layer_weight = list(checkpoint['model_state_dict'].values())[0]
-            if len(first_layer_weight.shape) == 4:  # Conv2d weight tensor
-                input_channels = first_layer_weight.shape[1]
-                logger.info(f"Detected CRNN input channels: {input_channels}")
-            else:
-                input_channels = 3  # Default to 3 channels
-                logger.warning("Could not detect input channels, defaulting to 3")
+            logger.info(f"Model config: img_height={img_height}, n_classes={n_classes}, n_hidden={n_hidden}")
             
-            # Initialize model
-            self.crnn_model = CustomCRNN(img_height, n_classes, n_hidden, input_channels=input_channels)
-            self.crnn_model.load_state_dict(checkpoint['model_state_dict'])
+            # The new model from training script is always 3-channel RGB
+            input_channels = 3
+            logger.info(f"Using RGB model with {input_channels} input channels")
+            
+            # Initialize model with the exact same architecture as training script
+            self.crnn_model = CustomCRNN(img_height, n_classes, n_hidden)
+            
+            # Load state dict with strict=False to handle any minor differences
+            model_dict = self.crnn_model.state_dict()
+            pretrained_dict = {k: v for k, v in checkpoint['model_state_dict'].items() 
+                             if k in model_dict and model_dict[k].shape == v.shape}
+            
+            if len(pretrained_dict) != len(checkpoint['model_state_dict']):
+                logger.warning(f"Loaded {len(pretrained_dict)}/{len(checkpoint['model_state_dict'])} layers - some layer shapes may have changed")
+            
+            model_dict.update(pretrained_dict)
+            self.crnn_model.load_state_dict(model_dict, strict=False)
+            
             self.crnn_model.to(self.device)
             self.crnn_model.eval()
             
             logger.info(f"CRNN model loaded successfully! Character set size: {len(self.char_list)}")
+            logger.info(f"Character set: {''.join(self.char_list[:20])}{'...' if len(self.char_list) > 20 else ''}")
             self.crnn_loaded = True
             
         except Exception as e:
@@ -335,23 +369,22 @@ class ANPRProcessor:
                         
                         # Filter by area and confidence
                         area = (x2 - x1) * (y2 - y1)
-                        logger.info(f"🔍 Detection: bbox=({x1},{y1},{x2},{y2}), conf={conf:.3f}, area={area}, class={cls}")
+                        class_name = self.yolo_model.names[cls] if self.yolo_model and cls in self.yolo_model.names else f"Class {cls}"
+                        logger.info(f"🔍 Detection: bbox=({x1},{y1},{x2},{y2}), conf={conf:.3f}, area={area}, class='{class_name}'")
                         
                         # Apply stricter thresholds for better accuracy
-                        if cls == 0 or cls == 1:  # Car or Motorcycle
-                            # Reasonable threshold for cars
-                            if conf >= 0.15:  # Lowered from 0.25 to 0.15 for debugging
+                        if cls in self.vehicle_class_indices:
+                            if conf >= 0.15:
                                 vehicles.append((x1, y1, x2, y2))
-                                logger.info(f"✅ Accepted car: conf={conf:.3f}, area={area}, class={cls}")
-                        elif cls == 2:  # License plate
-                            # Lower threshold for plates to see if any are detected
-                            if conf >= 0.1 and area >= 200:  # Lowered thresholds for debugging
+                                logger.info(f"✅ Accepted vehicle: conf={conf:.3f}, area={area}, class='{class_name}'")
+                        elif cls == self.plate_class_idx:  # License plate
+                            if conf >= 0.1 and area >= 200:
                                 plates.append((x1, y1, x2, y2))
                                 logger.info(f"✅ Accepted license plate: conf={conf:.3f}, area={area}")
                             else:
                                 logger.info(f"❌ Rejected plate: conf={conf:.3f}, area={area} (min_conf=0.1, min_area=200)")
                         else:
-                            logger.info(f"❓ Unknown class: {cls}, conf={conf:.3f}")
+                            logger.info(f"❓ Unknown class: {cls} ('{class_name}'), conf={conf:.3f}")
             
             # Filter plates to only keep those near vehicles (if enabled)
             if self.vehicle_plate_association_enabled:
@@ -445,118 +478,106 @@ class ANPRProcessor:
         
         return filtered_plates
     
-    def preprocess_plate_image(self, image: np.ndarray) -> Optional[torch.Tensor]:
-        """Preprocess plate image for CRNN model"""
+    def _preprocess_for_ocr(self, image: Image.Image) -> Image.Image:
+        """Enhanced image preprocessing for license plates, matching training script exactly."""
         try:
-            # Convert to grayscale if needed
+            img_array = np.array(image)
+            
+            # Ensure it's RGB (matching training script)
+            if len(img_array.shape) == 2:  # Grayscale image
+                img_array = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
+            elif len(img_array.shape) == 3 and img_array.shape[2] == 3:
+                # Already RGB, but ensure proper format
+                pass
+            else:
+                # Convert to RGB if needed
+                img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+            
+            # Apply CLAHE to the L-channel of the LAB color space (exactly as in training)
+            lab = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            cl = clahe.apply(l)
+            limg = cv2.merge((cl,a,b))
+            img_array = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
+
+            # Apply bilateral filter and sharpening (exactly as in training)
+            img_array = cv2.bilateralFilter(img_array, 9, 75, 75)
+            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+            img_array = cv2.filter2D(img_array, -1, kernel)
+            
+            return Image.fromarray(img_array)
+        except Exception as e:
+            logger.warning(f"Failed to apply OCR preprocessing: {e}")
+            return image  # Return original image on failure
+            
+    def preprocess_plate_image(self, image: np.ndarray) -> Optional[torch.Tensor]:
+        """Preprocess plate image for CRNN model to exactly match training pipeline."""
+        try:
+            # Convert BGR to RGB if needed
             if len(image.shape) == 3:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             else:
-                gray = image
-            
-            # Apply CLAHE for contrast enhancement
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
-            
-            # Denoise
-            denoised = cv2.bilateralFilter(enhanced, 9, 75, 75)
-            
-            # Adaptive threshold
-            binary = cv2.adaptiveThreshold(
-                denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-            )
-            
-            # Resize while maintaining aspect ratio
-            h, w = binary.shape
-            scale = Config.OCR_IMG_HEIGHT / h
-            new_width = int(w * scale)
-            
-            if new_width > Config.OCR_IMG_WIDTH:
-                scale = Config.OCR_IMG_WIDTH / w
-                new_height = int(h * scale)
-                new_width = Config.OCR_IMG_WIDTH
-            else:
-                new_height = Config.OCR_IMG_HEIGHT
-            
-            resized = cv2.resize(binary, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-            
-            # Create blank canvas and center the image
-            result = np.ones((Config.OCR_IMG_HEIGHT, Config.OCR_IMG_WIDTH), dtype=np.uint8) * 255
-            y_offset = (Config.OCR_IMG_HEIGHT - new_height) // 2
-            x_offset = (Config.OCR_IMG_WIDTH - new_width) // 2
-            result[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = resized
-            
-            # Convert to tensor
-            pil_image = Image.fromarray(result)
-            
-            # Check if model expects 3 channels
-            if hasattr(self, 'crnn_model') and self.crnn_model is not None:
-                expected_channels = self.crnn_model.input_channels
-            else:
-                expected_channels = 1  # Default to grayscale
-                
-            if expected_channels == 3:
-                # Convert grayscale to RGB for 3-channel model
-                pil_image = pil_image.convert('RGB')
-                transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-                ])
-            else:
-                # Keep as grayscale for 1-channel model
-                transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.5,), (0.5,))
-                ])
+                pil_image = Image.fromarray(image).convert('RGB')
+
+            # Apply the exact same preprocessing as in training
+            pil_image = self._preprocess_for_ocr(pil_image)
+
+            # Use the exact same transforms as validation in training script
+            transform = transforms.Compose([
+                transforms.Resize((Config.OCR_IMG_HEIGHT, Config.OCR_IMG_WIDTH)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # RGB normalization
+            ])
             
             tensor_image = transform(pil_image).unsqueeze(0)
-            logger.debug(f"Preprocessed image shape: {tensor_image.shape}, expected channels: {expected_channels}")
+            logger.debug(f"Preprocessed image shape: {tensor_image.shape}")
             return tensor_image
-            
+
         except Exception as e:
             logger.error(f"Error preprocessing plate image: {e}")
             return None
     
     def decode_ctc_predictions(self, outputs) -> Tuple[List[str], List[float]]:
-        """Decodes CTC predictions using beam search if available, otherwise greedy decoding."""
-        if BEAM_SEARCH_AVAILABLE and outputs is not None:
-            try:
-                probs = torch.softmax(outputs, dim=2).permute(1, 0, 2).cpu().numpy()
-                decoded_texts, confidences = [], []
-                
-                for p in probs:
-                    beam = beam_search(p, vocabulary=self.char_list, beam_size=10)
-                    if beam:
-                        decoded_texts.append(beam[0][0])
-                        confidences.append(beam[0][1])
-                    else:
-                        decoded_texts.append("")
-                        confidences.append(0.0)
-                return decoded_texts, confidences
-            except Exception as e:
-                logger.warning(f"Beam search decoding failed: {e}. Falling back to greedy decoding.")
+        """Decodes CTC predictions using the exact same logic as training script."""
+        try:
+            # Use the exact same decoding logic as in train_custom_crnn.py
+            preds_idx = torch.argmax(outputs, dim=2)  # (seq_len, batch)
+            preds_idx = preds_idx.transpose(0, 1).cpu().numpy()  # (batch, seq_len)
+            
+            decoded_texts = []
+            confidences = []
 
-        # Fallback to greedy decoding
-        preds_idx = torch.argmax(outputs, dim=2).transpose(0, 1).cpu().numpy()
-        decoded_texts, confidences = [], []
-        probs = torch.softmax(outputs, dim=2).transpose(0, 1).cpu().detach().numpy()
-        for i in range(preds_idx.shape[0]):
-            batch_preds, batch_probs = preds_idx[i], probs[i]
-            text, char_confidence, last_char_idx = [], [], 0
-            for t, char_idx in enumerate(batch_preds):
-                if char_idx != 0 and char_idx != last_char_idx:
-                    if char_idx < len(self.char_list):
-                        text.append(self.char_list[char_idx])
-                        char_confidence.append(batch_probs[t, char_idx])
-                last_char_idx = char_idx
-            decoded_texts.append("".join(text))
-            confidences.append(np.mean(char_confidence) if char_confidence else 0.0)
-        return decoded_texts, confidences
+            probs = torch.softmax(outputs, dim=2).transpose(0,1).cpu().detach().numpy() # (batch, seq_len, num_classes)
+
+            for i in range(preds_idx.shape[0]): # Iterate over batch
+                batch_preds = preds_idx[i]
+                batch_probs = probs[i]
+                
+                text = []
+                char_confidence = []
+                last_char_idx = 0 
+                for t in range(len(batch_preds)):
+                    char_idx = batch_preds[t]
+                    if char_idx != 0 and char_idx != last_char_idx: # Not blank and not repeated
+                        if char_idx < len(self.char_list): # Check index bounds
+                            text.append(self.char_list[char_idx])
+                            char_confidence.append(batch_probs[t, char_idx])
+                    last_char_idx = char_idx
+                
+                decoded_texts.append("".join(text))
+                avg_conf = np.mean(char_confidence) if char_confidence else 0.0
+                confidences.append(avg_conf)
+                
+            return decoded_texts, confidences
+        except Exception as e:
+            logger.error(f"Error in CTC decoding: {e}")
+            return [], []
     
     def recognize_plate_text(self, plate_image: np.ndarray) -> Tuple[Optional[str], float]:
-        """Recognize text from plate image using CRNN"""
+        """Recognize text from plate image using CRNN with exact training script logic"""
         if self.crnn_model is None or self.char_list is None:
-            logger.info("❌ CRNN model or character list not available")
+            logger.warning("❌ CRNN model or character list not available")
             return None, 0.0
             
         try:
@@ -567,19 +588,24 @@ class ANPRProcessor:
                 logger.info("❌ OCR: Plate image quality check failed")
                 return None, 0.0
             
-            # Preprocess image
+            # Preprocess image using exact training pipeline
             tensor_image = self.preprocess_plate_image(plate_image)
             if tensor_image is None:
                 logger.info("❌ OCR: Image preprocessing failed")
                 return None, 0.0
+            
+            logger.info(f"🔍 OCR: Preprocessed tensor shape: {tensor_image.shape}")
             
             # Move to device
             tensor_image = tensor_image.to(self.device)
             
             # Run inference
             with torch.no_grad():
-                outputs = self.crnn_model(tensor_image)
+                outputs = self.crnn_model(tensor_image)  # (seq_len, batch, num_classes)
                 logger.info(f"🔍 OCR: CRNN outputs shape: {outputs.shape}")
+                logger.info(f"🔍 OCR: Outputs min/max: {outputs.min().item():.3f}/{outputs.max().item():.3f}")
+                
+                # Use the exact same decoding as training script
                 decoded_texts, confidences = self.decode_ctc_predictions(outputs)
             
             logger.info(f"🔍 OCR: Decoded texts: {decoded_texts}, confidences: {confidences}")
@@ -604,6 +630,8 @@ class ANPRProcessor:
             
         except Exception as e:
             logger.error(f"Error recognizing plate text: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return None, 0.0
 
     def _is_good_plate_image(self, image: np.ndarray) -> bool:
@@ -3413,7 +3441,7 @@ def configure_camera(camera_index, width=None, height=None, fps=None):
         logger.error(f"Error configuring camera {camera_index}: {e}")
         return None
 
-def main():
+def main(): 
     """Main application entry point"""
     try:
         app = QApplication(sys.argv)

@@ -65,14 +65,20 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 class Config:
-    # Model paths (using user provided paths)
-    YOLO_MODEL_PATH = r"D:\Work\Projects\ANPR\models\detection\yolo11n_anpr\weights\best.pt"
-    CRNN_MODEL_PATH = r"D:\Work\Projects\ANPR\models\ocr\crnn_v7\best_crnn_model_epoch125_acc0.9010.pth"
-    # CRNN_MODEL_PATH = r"D:\Work\Projects\ANPR\models\ocr\crnn_v2\best_multiline_crnn_epoch51_acc0.9966.pth"
-    CRNN_MODEL_PATH_ALT = r"D:\Work\Projects\ANPR_3\saved_models\stable_crnn_v6\checkpoint_epoch_310_acc0.923.pth"
+    # Get the project root directory (parent of src/)
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    
+    # Model paths - Using relative paths for cross-platform compatibility
+    # Models are in: models/application_runner/
+    YOLO_MODEL_PATH = PROJECT_ROOT / "models" / "application_runner" / "best.pt"
+    CRNN_MODEL_PATH = PROJECT_ROOT / "models" / "application_runner" / "best_crnn_model_epoch125_acc0.9010.pth"
+    
+    # Model Information
+    YOLO_MODEL_NAME = "yolo11n_anpr"  # YOLO11n for ANPR detection
+    CRNN_MODEL_VERSION = "v7"  # CRNN version 7 (90.10% accuracy)
     
     # Video path
-    VIDEO_PATH = r"D:\Work\Projects\ANPR\data\Input"
+    VIDEO_PATH = PROJECT_ROOT / "data" / "Input"
     
     # Camera configuration
     DEFAULT_CAMERA_INDEX = 0
@@ -96,7 +102,7 @@ class Config:
     SIMILARITY_THRESHOLD = 0.8
     
     # Output
-    OUTPUT_DIR = Path(r"D:\Work\Projects\ANPR\outputs")
+    OUTPUT_DIR = PROJECT_ROOT / "outputs"
     SAVE_DETECTIONS = True # Default to saving detections
     NUM_VERTICAL_ROWS = 3 # For multi-line CRNN model
 
@@ -283,11 +289,9 @@ class ANPRProcessor:
         """Load CRNN model for OCR"""
         try:
             model_path = Config.CRNN_MODEL_PATH
-            if not Path(model_path).exists():
-                model_path = Config.CRNN_MODEL_PATH_ALT
                 
             if not Path(model_path).exists():
-                raise FileNotFoundError(f"CRNN model not found at either path")
+                raise FileNotFoundError(f"CRNN model not found at: {model_path}")
                 
             logger.info(f"Loading CRNN model from: {model_path}")
             
@@ -2433,7 +2437,7 @@ class MainWindow(QMainWindow):
     def browse_video_file(self):
         """Browse for video file"""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Video File", Config.VIDEO_PATH,
+            self, "Select Video File", str(Config.VIDEO_PATH),
             "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv);;All Files (*)"
         )
         

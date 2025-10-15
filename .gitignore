@@ -1,22 +1,48 @@
-models/
-data/
+# Large model folders (training checkpoints - not needed for deployment)
+models/detection/
+models/ocr/
+# Exception: Track the application_runner folder (production models)
+!models/application_runner/
+!models/application_runner/*.pt
+!models/application_runner/*.pth
+
+# Data directories - ignore most data except essential files
+data/*
+# Exception: Track Input folder for demo videos
+!data/Input/
+!data/Input/*.mp4
+!data/Input/*.avi
+# Exception: Track processed folder for character set
+!data/processed/
+!data/processed/all_chars.txt
+
+# Output directories (generated at runtime)
 outputs/
 logs/
+
+# Python cache and compiled files
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.pyw
 *.pyz
+
+# Trash and IDE folders
 Trash/
 .vscode/
 .idea/
 .pytest_cache/
+
+# OS specific
 .DS_Store
+
+# Environment files
 .env
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
 
+# Documentation
 model_ocr.md

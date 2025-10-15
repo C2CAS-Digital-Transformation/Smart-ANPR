@@ -44,10 +44,13 @@ ANPR/
 │   ├── processed/          # Processed data
 │   └── annotations/        # Training annotations
 ├── models/                  # Trained models
-│   ├── detection/          # YOLO models
-│   │   └── yolo11/
-│   └── ocr/               # CRNN models
-│       └── crnn/
+│   ├── application_runner/ # ⭐ Production models (lightweight)
+│   │   ├── best.pt        # YOLO11n ANPR detection model
+│   │   └── best_crnn_model_epoch125_acc0.9010.pth  # CRNN OCR v7 (90.10%)
+│   ├── detection/          # Full YOLO training checkpoints
+│   │   └── yolo11n_anpr/  # (Larger files - for training/evaluation)
+│   └── ocr/               # Full CRNN training checkpoints
+│       └── crnn_v7/       # (Larger files - for training/evaluation)
 ├── outputs/                # Output results
 │   ├── detected_plates/    # Detected plate images
 │   ├── logs/              # Log files
@@ -57,6 +60,9 @@ ANPR/
     └── demo.py           # Demo scripts
 ```
 
+> **Note:** The `models/application_runner/` folder contains optimized production models for deployment. 
+> Larger training checkpoints are stored separately for development purposes.
+
 ## 🛠️ Installation
 
 ### Prerequisites
@@ -65,7 +71,7 @@ ANPR/
 - CUDA-capable GPU (recommended for training)
 - Webcam or video files for testing
 
-### Option 1: Quick Setup
+### Option 1: Quick Setup (Production Deployment)
 
 ```bash
 # Clone the repository
@@ -75,9 +81,16 @@ cd ANPR
 # Install dependencies
 pip install -r requirements.txt
 
-# Create directory structure
-python src/utils/config.py
+# Verify models are in place
+ls models/application_runner/
+# Should show: best.pt and best_crnn_model_epoch125_acc0.9010.pth
+
+# Run the application
+python src/main.py
 ```
+
+**Note:** The production models in `models/application_runner/` are included in the repository (~10MB total). 
+No additional downloads needed!
 
 ### Option 2: Development Setup
 
@@ -100,21 +113,29 @@ pip install -e .[fast]
 
 ### 1. Model Setup
 
-The system includes pre-trained models optimized for ANPR:
+The system uses pre-trained models optimized for ANPR, located in `models/application_runner/`:
 
-**YOLO Detection Models:**
+**Production Models (Application Runner):**
 
-- Primary: `models/detection/yolo11n_anpr/weights/best.pt`
-- Alternative: `models/detection/yolo11n_anpr_small_batch/weights/best.pt`
+- **Detection Model:** `models/application_runner/best.pt`
+  - Type: YOLO11n ANPR
+  - Size: Lightweight (~6MB)
+  - Performance: 90.3% mAP@0.5
+  
+- **OCR Model:** `models/application_runner/best_crnn_model_epoch125_acc0.9010.pth`
+  - Type: CRNN v7
+  - Accuracy: 90.10%
+  - Character set: 36 characters (0-9, A-Z, [blank])
 
-**CRNN OCR Models (v1):**
+**Path Configuration:**
+The system uses **relative paths** that work on any system after cloning:
+```python
+# Automatically resolves to project root
+PROJECT_ROOT / "models" / "application_runner" / "best.pt"
+PROJECT_ROOT / "models" / "application_runner" / "best_crnn_model_epoch125_acc0.9010.pth"
+```
 
-- Primary: `models/ocr/crnn_v1/best_multiline_crnn_epoch292_acc0.9304.pth` (93.04% accuracy)
-- Alternative: `models/ocr/crnn_v1/checkpoint_epoch_310_acc0.923.pth` (92.3% accuracy)
-- Character set: `data/processed/all_chars.txt`
-
-**Model Selection:**
-The system automatically selects the best available model from each category.
+No manual path configuration needed! Just clone and run.
 
 ### 2. Run the Application
 
@@ -222,12 +243,27 @@ data/processed/
 
 ### Main Configuration
 
-Edit `src/utils/config.py` to modify:
+The `Config` class in `src/main.py` uses **automatic path resolution**:
 
-- Model paths
-- Detection thresholds
-- Camera settings
-- Output directories
+```python
+class Config:
+    # Auto-detects project root - works on any system
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    
+    # Model paths (relative, cross-platform)
+    YOLO_MODEL_PATH = PROJECT_ROOT / "models" / "application_runner" / "best.pt"
+    CRNN_MODEL_PATH = PROJECT_ROOT / "models" / "application_runner" / "best_crnn_model_epoch125_acc0.9010.pth"
+    
+    # Model info
+    YOLO_MODEL_NAME = "yolo11n_anpr"
+    CRNN_MODEL_VERSION = "v7"
+```
+
+**Key Features:**
+- ✅ Cross-platform compatibility (Windows, Linux, macOS)
+- ✅ No manual path configuration required
+- ✅ Relative paths work after git clone
+- ✅ Automatic project root detection
 
 ### Model-specific Configuration
 
@@ -243,6 +279,41 @@ python scripts/evaluate.py
 # Or using entry point
 anpr-evaluate
 ```
+
+## 🗂️ Model Architecture & Versions
+
+### Current Production Models (v7)
+
+**Location:** `models/application_runner/`
+
+#### Detection Model: YOLO11n ANPR
+- **File:** `best.pt`
+- **Architecture:** YOLO11n (nano variant)
+- **Input Size:** 416x416
+- **Classes:** Car, Motorcycle, Number_Plate
+- **Performance:** 90.3% mAP@0.5
+- **Speed:** 80-120 FPS (RTX 3060)
+
+#### OCR Model: CRNN v7
+- **File:** `best_crnn_model_epoch125_acc0.9010.pth`
+- **Architecture:** Enhanced Multi-Line CRNN with Attention
+- **Input Size:** 256x64 (RGB)
+- **Character Set:** 36 characters (0-9, A-Z, [blank])
+- **Accuracy:** 90.10% (sequence-level)
+- **Training Epochs:** 125
+- **Features:**
+  - Bidirectional LSTM with 2 layers
+  - Dropout: 30%
+  - CLAHE preprocessing
+  - Multi-line plate support
+
+### Development Models (Full Training History)
+
+For training, evaluation, and research purposes, full model checkpoints are available in:
+- `models/detection/yolo11n_anpr/` - Complete YOLO training history
+- `models/ocr/crnn_v7/` - Complete CRNN v7 training checkpoints
+
+**Note:** These folders contain larger files and are excluded from quick deployments.
 
 ## 🎯 Performance
 
@@ -273,25 +344,33 @@ anpr-evaluate
 - **Jetson Nano**: 8-15 FPS
 - **Raspberry Pi 4**: 3-8 FPS
 
-### OCR Model (Enhanced Multi-Line CRNN v1)
+### OCR Model (Enhanced Multi-Line CRNN v7)
 
 - **Architecture**: Enhanced Multi-Line CRNN with Attention  
-- **Input Size**: 256x64 pixels
+- **Input Size**: 256x64 pixels (RGB)
 - **Character Set**: 36 characters (0-9, A-Z, [blank])
-- **Model Location**: `models/ocr/crnn_v1/`
+- **Model Location**: `models/application_runner/best_crnn_model_epoch125_acc0.9010.pth`
 
-#### Training Results:
+#### Training Results (v7):
 
-- **Best Validation Accuracy**: 93.04% (epoch 292)
-- **Character-level Accuracy**: 98.01%
-- **Total Training Epochs**: 312
-- **Training Dataset**: 22,055 samples
-- **Validation Dataset**: 2,757 samples
-- **Multi-line Support**: 2,018 real plates detected
-- **Training Progress**: 45 saved checkpoints showing progression from 75.84% to 93.04%
-- **Model Variants**:
-  - Primary: `best_multiline_crnn_epoch292_acc0.9304.pth` (93.04%)
-  - Alternative: `checkpoint_epoch_310_acc0.923.pth` (92.3%)
+- **Best Validation Accuracy**: 90.10% (epoch 125)
+- **Architecture**: Bidirectional LSTM (2 layers)
+- **Hidden Units**: 256
+- **Dropout**: 30%
+- **Input Channels**: 3 (RGB with CLAHE preprocessing)
+- **Training Features**:
+  - Label smoothing (10%)
+  - AdamW optimizer with weight decay
+  - Multi-line plate support
+  - Real-world augmentation pipeline
+
+#### Previous Versions:
+
+- **CRNN v1**: 93.04% accuracy (312 epochs) - Available in `models/ocr/crnn_v1/`
+  - File: `best_multiline_crnn_epoch292_acc0.9304.pth`
+  - Higher accuracy, larger model size
+  
+**Current Production Model**: v7 balances accuracy and inference speed for real-time applications.
 
 ## 📈 Training Progress
 
